@@ -302,6 +302,21 @@ class OffloadingConnectorWorker:
             assert success
         self._unsubmitted_store_jobs.clear()
 
+        # Save preempted requests' KV synchronously before the forward pass
+        # overwrites the freed GPU blocks.
+        if kv_connector_metadata.reqs_to_preempt_store:
+            preempt_job_ids: set[int] = set()
+            for req_id, transfer_spec in (
+                kv_connector_metadata.reqs_to_preempt_store.items()
+            ):
+                job_id = self._generate_job_id()
+                self._jobs[job_id] = (req_id, True)
+                self._store_jobs[req_id].add(job_id)
+                success = self.worker.transfer_async(job_id, transfer_spec)
+                assert success
+                preempt_job_ids.add(job_id)
+            self.worker.wait(preempt_job_ids)
+
         for req_id in kv_connector_metadata.reqs_to_flush or ():
             job_ids = self._store_jobs.get(req_id)
             if job_ids:

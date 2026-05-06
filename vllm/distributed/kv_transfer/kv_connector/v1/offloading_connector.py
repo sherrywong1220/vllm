@@ -131,6 +131,15 @@ class OffloadingConnector(KVConnectorBase_V1):
         assert self.connector_scheduler is not None
         self.connector_scheduler.update_connector_output(connector_output)
 
+    def request_preempted(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> None:
+        assert self.connector_scheduler is not None
+        assert len(block_ids) == 1
+        self.connector_scheduler.request_preempted(request, block_ids[0])
+
     def request_finished(
         self,
         request: "Request",

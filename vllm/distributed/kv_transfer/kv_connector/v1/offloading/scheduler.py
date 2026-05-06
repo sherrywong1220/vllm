@@ -54,6 +54,9 @@ class OffloadingConnectorScheduler:
         self._reqs_being_stored = defaultdict[ReqId, set[BlockHash]](set)
         self._reqs_being_loaded = defaultdict[ReqId, set[BlockHash]](set)
 
+        # preemption store specs accumulated between build_connector_meta calls
+        self._preempt_store_specs: list[tuple[ReqId, TransferSpec]] = []
+
     def _get_block_hashes(
         self,
         req: Request,
@@ -269,10 +272,16 @@ class OffloadingConnectorScheduler:
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
     ) -> KVConnectorMetadata:
+        reqs_to_preempt_store: dict[ReqId, TransferSpec] | None = None
+        if self._preempt_store_specs:
+            reqs_to_preempt_store = dict(self._preempt_store_specs)
+            self._preempt_store_specs.clear()
+
         meta = OffloadingConnectorMetadata(
             reqs_to_load=self._reqs_to_load,
             reqs_to_store=self._get_reqs_to_store(scheduler_output),
             reqs_to_flush=scheduler_output.preempted_req_ids,
+            reqs_to_preempt_store=reqs_to_preempt_store,
         )
         self._reqs_to_load = {}
 
@@ -305,6 +314,72 @@ class OffloadingConnectorScheduler:
                 if self._blocks_being_loaded:
                     self._blocks_being_loaded.difference_update(block_hashes)
                 self.manager.complete_load(block_hashes)
+
+    def request_preempted(
+        self,
+        request: Request,
+        block_ids: list[int],
+    ) -> None:
+        """Save computed KV to CPU before the request's GPU blocks are freed."""
+        req_id = request.request_id
+        num_computed = request.num_computed_tokens
+        num_full_blocks = num_computed // self.offloaded_block_size
+
+        if num_full_blocks <= 0:
+            return
+
+        start_block_idx = self._next_stored_block_idx.get(req_id, 0)
+        num_new_blocks = num_full_blocks - start_block_idx
+        if num_new_blocks <= 0:
+            return
+
+        block_hashes = self._get_block_hashes(
+            request, start_idx=start_block_idx, end_idx=num_full_blocks
+        )
+        store_output = self.manager.prepare_store(block_hashes)
+        if store_output is None:
+            logger.warning(
+                "Request %s: cannot store %s preempted blocks",
+                req_id, num_new_blocks,
+            )
+            return
+
+        self._next_stored_block_idx[req_id] = num_full_blocks
+
+        if not store_output.block_hashes_to_store:
+            return
+        block_hashes_to_store = set(store_output.block_hashes_to_store)
+
+        block_hashes = self._get_block_hashes(
+            request, end_idx=num_full_blocks
+        )
+        self.manager.touch(block_hashes)
+
+        new_block_hashes = self._get_block_hashes(
+            request, start_idx=start_block_idx, end_idx=num_full_blocks
+        )
+        dst_spec = store_output.store_spec
+        src_block_ids: list[int] = []
+        for idx, blk_hash in enumerate(new_block_hashes):
+            if blk_hash not in block_hashes_to_store:
+                continue
+            offloaded_block_idx = start_block_idx + idx
+            gpu_block_idx = offloaded_block_idx * self.block_size_factor
+            for i in range(self.block_size_factor):
+                src_block_ids.append(block_ids[gpu_block_idx + i])
+        src_spec = GPULoadStoreSpec(
+            src_block_ids, group_sizes=(len(src_block_ids),)
+        )
+
+        self._preempt_store_specs.append((req_id, (src_spec, dst_spec)))
+        self._reqs_being_stored[req_id] |= block_hashes_to_store
+
+        logger.debug(
+            "Request %s preempt-saving %s blocks (computed=%s, "
+            "offloaded_block_size=%s)",
+            req_id, len(block_hashes_to_store), num_computed,
+            self.offloaded_block_size,
+        )
 
     def request_finished(
         self,

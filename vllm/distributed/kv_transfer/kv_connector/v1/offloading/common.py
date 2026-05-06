@@ -13,3 +13,4 @@ class OffloadingConnectorMetadata(KVConnectorMetadata):
     reqs_to_load: dict[ReqId, TransferSpec]
     reqs_to_store: dict[ReqId, TransferSpec]
     reqs_to_flush: set[str] | None = None
+    reqs_to_preempt_store: dict[ReqId, TransferSpec] | None = None

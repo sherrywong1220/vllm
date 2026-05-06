@@ -527,6 +527,24 @@ class KVConnectorBase_V1(ABC):
         """
         return
 
+    def request_preempted(
+        self,
+        request: "Request",
+        block_ids: tuple[list[int], ...],
+    ) -> None:
+        """
+        Called when a running request is about to be preempted, before its
+        blocks are freed. Allows the connector to save the computed KV to
+        an external cache so that it can be restored via
+        get_num_new_matched_tokens when the request is re-admitted.
+
+        Args:
+            request: The request being preempted.
+            block_ids: The GPU block IDs currently holding the request's KV,
+                       one list per KV cache group.
+        """
+        return
+
     def request_finished(
         self,
         request: "Request",

@@ -962,6 +962,10 @@ class Scheduler(SchedulerInterface):
         assert request.status == RequestStatus.RUNNING, (
             "Only running requests can be preempted"
         )
+        if self.connector is not None:
+            block_ids = self.kv_cache_manager.get_block_ids(
+                request.request_id)
+            self.connector.request_preempted(request, block_ids)
         self.kv_cache_manager.free(request)
         self.encoder_cache_manager.free(request)
         request.status = RequestStatus.PREEMPTED
