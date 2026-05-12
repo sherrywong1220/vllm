@@ -3,6 +3,7 @@
 from collections import defaultdict
 from collections.abc import Iterable
 from itertools import islice
+import os
 from typing import Any
 
 from vllm.distributed.kv_events import BlockRemoved, BlockStored, KVCacheEvent
@@ -17,6 +18,7 @@ from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.kv_cache_utils import BlockHash
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_offload.abstract import OffloadingManager
+from vllm.v1.kv_offload.reuse_manager import FilterReusedOffloadingManager
 from vllm.v1.kv_offload.mediums import GPULoadStoreSpec
 from vllm.v1.kv_offload.spec import OffloadingSpec
 from vllm.v1.kv_offload.worker.worker import TransferSpec
@@ -24,6 +26,7 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+CXL_KV_DIAG = os.getenv("CXL_KV_DIAG") == "1"
 
 
 class OffloadingConnectorScheduler:
@@ -35,6 +38,26 @@ class OffloadingConnectorScheduler:
         self.offloaded_block_size = self.gpu_block_size * spec.block_size_factor
         self.block_size_factor = spec.block_size_factor
         self.manager: OffloadingManager = spec.get_manager()
+        # For preemption saves, bypass FilterReusedOffloadingManager's
+        # store_threshold — preempted blocks must be saved unconditionally.
+        if isinstance(self.manager, FilterReusedOffloadingManager):
+            self._preempt_manager: OffloadingManager = self.manager._backing
+        else:
+            self._preempt_manager: OffloadingManager = self.manager
+
+        if CXL_KV_DIAG:
+            from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+            _mgr = self._preempt_manager
+            if isinstance(_mgr, CPUOffloadingManager):
+                logger.warning(
+                    "[CXL-KV-DIAG] CPUOffloadingManager: num_blocks=%d, "
+                    "block_size=%d, block_size_factor=%d, manager_type=%s",
+                    _mgr._num_blocks, _mgr.block_size,
+                    self.block_size_factor, type(self.manager).__name__)
+            else:
+                logger.warning(
+                    "[CXL-KV-DIAG] manager_type=%s, preempt_manager_type=%s",
+                    type(self.manager).__name__, type(_mgr).__name__)
 
         self._requests: dict[ReqId, Request] = {}
         # list of GPU block IDs per request
@@ -108,6 +131,12 @@ class OffloadingConnectorScheduler:
         hits = self.manager.lookup(
             self._get_block_hashes(request, start_idx=start_block_idx)
         )
+        if CXL_KV_DIAG and request.num_preemptions > 0 and hits and hits > 0:
+            logger.warning(
+                "[CXL-KV-DIAG] lookup preempted req=%s, num_computed=%d, "
+                "start_block=%d, total_blocks=%d, hits=%s",
+                request.request_id, num_computed_tokens,
+                start_block_idx, num_blocks, hits)
         if hits is None:
             # indicates a lookup that should be tried later
             return None, False
@@ -227,12 +256,23 @@ class OffloadingConnectorScheduler:
             )
             store_output = self.manager.prepare_store(new_block_hashes)
             if store_output is None:
-                logger.warning(
-                    "Request %s: cannot store %s blocks", req_id, num_new_blocks
-                )
+                if CXL_KV_DIAG and start_block_idx == 0:
+                    logger.warning(
+                        "[CXL-KV-DIAG] speculative store FAILED "
+                        "(first attempt) "
+                        "for req=%s, need=%d blocks",
+                        req_id, num_new_blocks)
                 continue
 
+            if CXL_KV_DIAG:
+                prev_stored = self._next_stored_block_idx.get(req_id, 0)
             self._next_stored_block_idx[req_id] = num_blocks
+            if CXL_KV_DIAG:
+                if prev_stored == 0:
+                    logger.warning(
+                        "[CXL-KV-DIAG] speculative store FIRST OK "
+                        "for req=%s, stored blocks [0..%d)",
+                        req_id, num_blocks)
 
             if not store_output.block_hashes_to_store:
                 continue
@@ -290,8 +330,38 @@ class OffloadingConnectorScheduler:
         for req_id in scheduler_output.preempted_req_ids or ():
             block_hashes = self._reqs_being_stored.get(req_id)
             if block_hashes:
+                if CXL_KV_DIAG:
+                    logger.warning(
+                        "[CXL-KV-DIAG] preempt complete_store for req=%s, "
+                        "%d block hashes → ref_cnt will become 0",
+                        req_id, len(block_hashes))
                 self.manager.complete_store(block_hashes)
                 block_hashes.clear()
+            else:
+                if CXL_KV_DIAG:
+                    logger.warning(
+                        "[CXL-KV-DIAG] preempt complete_store SKIPPED "
+                        "for req=%s, no blocks in _reqs_being_stored "
+                        "(speculative store never succeeded)",
+                        req_id)
+
+            if CXL_KV_DIAG:
+                from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+                _mgr = self._preempt_manager
+                if isinstance(_mgr, CPUOffloadingManager):
+                    rc_neg1 = rc_0 = rc_pos = 0
+                    for _, blk in _mgr._policy.blocks.items():
+                        if blk.ref_cnt < 0:
+                            rc_neg1 += 1
+                        elif blk.ref_cnt == 0:
+                            rc_0 += 1
+                        else:
+                            rc_pos += 1
+                    logger.warning(
+                        "[CXL-KV-DIAG] buffer after preempt handling: "
+                        "total=%d, free=%d, rc_neg1=%d, rc_0=%d, rc_pos=%d",
+                        _mgr._num_blocks, _mgr._get_num_free_blocks(),
+                        rc_neg1, rc_0, rc_pos)
 
         return meta
 
@@ -336,12 +406,41 @@ class OffloadingConnectorScheduler:
         block_hashes = self._get_block_hashes(
             request, start_idx=start_block_idx, end_idx=num_full_blocks
         )
-        store_output = self.manager.prepare_store(block_hashes)
+        if CXL_KV_DIAG:
+            block_hashes_list = list(block_hashes)
+            from vllm.v1.kv_offload.cpu.manager import CPUOffloadingManager
+            _mgr = self._preempt_manager
+            if isinstance(_mgr, CPUOffloadingManager):
+                rc_neg1 = rc_0 = rc_pos = 0
+                already_stored = 0
+                for bh in block_hashes_list:
+                    if _mgr._policy.get(bh) is not None:
+                        already_stored += 1
+                for _, blk in _mgr._policy.blocks.items():
+                    if blk.ref_cnt < 0:
+                        rc_neg1 += 1
+                    elif blk.ref_cnt == 0:
+                        rc_0 += 1
+                    else:
+                        rc_pos += 1
+                logger.warning(
+                    "[CXL-KV-DIAG] prepare_store: req=%s, need=%d, "
+                    "already_stored=%d, free=%d, total=%d, allocated=%d, "
+                    "rc_neg1=%d, rc_0=%d, rc_pos=%d",
+                    req_id, len(block_hashes_list), already_stored,
+                    _mgr._get_num_free_blocks(), _mgr._num_blocks,
+                    _mgr._num_allocated_blocks,
+                    rc_neg1, rc_0, rc_pos)
+            store_output = self._preempt_manager.prepare_store(
+                block_hashes_list)
+        else:
+            store_output = self._preempt_manager.prepare_store(block_hashes)
         if store_output is None:
-            logger.warning(
-                "Request %s: cannot store %s preempted blocks",
-                req_id, num_new_blocks,
-            )
+            if CXL_KV_DIAG:
+                logger.warning(
+                    "[CXL-KV-DIAG] request %s: cannot store %s "
+                    "preempted blocks",
+                    req_id, num_new_blocks)
             return
 
         self._next_stored_block_idx[req_id] = num_full_blocks
@@ -373,6 +472,12 @@ class OffloadingConnectorScheduler:
 
         self._preempt_store_specs.append((req_id, (src_spec, dst_spec)))
         self._reqs_being_stored[req_id] |= block_hashes_to_store
+
+        if CXL_KV_DIAG:
+            logger.warning(
+                "[CXL-KV-DIAG] preempt-save req=%s, blocks=%d, "
+                "computed_tokens=%d",
+                req_id, len(block_hashes_to_store), num_computed)
 
         logger.debug(
             "Request %s preempt-saving %s blocks (computed=%s, "

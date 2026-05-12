@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -62,6 +63,7 @@ from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
 
 logger = init_logger(__name__)
+CXL_KV_DIAG = os.getenv("CXL_KV_DIAG") == "1"
 
 
 class Scheduler(SchedulerInterface):
@@ -83,6 +85,7 @@ class Scheduler(SchedulerInterface):
         self.kv_events_config = vllm_config.kv_events_config
         self.parallel_config = vllm_config.parallel_config
         self.log_stats = log_stats
+        self._external_kv_tokens_loaded: int = 0
         self.observability_config = vllm_config.observability_config
         self.kv_metrics_collector: KVCacheMetricsCollector | None = None
         if self.observability_config.kv_cache_metrics:
@@ -756,6 +759,13 @@ class Scheduler(SchedulerInterface):
 
                 if new_blocks is None:
                     # The request cannot be scheduled.
+                    if CXL_KV_DIAG and load_kv_async:
+                        logger.warning(
+                            "[CXL-KV-DIAG] allocate_slots FAILED async KV "
+                            "req=%s ext_tokens=%d free=%d",
+                            request_id, num_external_computed_tokens,
+                            self.kv_cache_manager.block_pool
+                            .get_num_free_blocks())
 
                     # NOTE: we need to untouch the request from the encode cache
                     # manager
@@ -785,6 +795,14 @@ class Scheduler(SchedulerInterface):
 
                 request = request_queue.pop_request()
                 if load_kv_async:
+                    self._external_kv_tokens_loaded += (
+                        num_external_computed_tokens)
+                    if CXL_KV_DIAG:
+                        logger.warning(
+                            "[CXL-KV-DIAG] allocate_slots OK → "
+                            "WAITING_FOR_REMOTE_KVS req=%s ext_tokens=%d",
+                            request.request_id,
+                            num_external_computed_tokens)
                     # If loading async, allocate memory and put request
                     # into the WAITING_FOR_REMOTE_KV state.
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
@@ -1956,6 +1974,8 @@ class Scheduler(SchedulerInterface):
         connector_stats_payload = (
             kv_connector_stats.data if kv_connector_stats else None
         )
+        ext_kv = self._external_kv_tokens_loaded
+        self._external_kv_tokens_loaded = 0
         return SchedulerStats(
             num_running_reqs=len(self.running),
             num_waiting_reqs=len(self.waiting) + len(self.skipped_waiting),
@@ -1968,6 +1988,7 @@ class Scheduler(SchedulerInterface):
             kv_connector_stats=connector_stats_payload,
             cudagraph_stats=cudagraph_stats,
             perf_stats=perf_stats,
+            external_kv_tokens_loaded=ext_kv,
         )
 
     def _get_encoder_cache_usage(self) -> float:

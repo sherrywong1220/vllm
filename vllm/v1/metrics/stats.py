@@ -196,6 +196,9 @@ class SchedulerStats:
 
     perf_stats: PerfStats | None = None
 
+    num_preempted_reqs: int = 0
+    external_kv_tokens_loaded: int = 0
+
 
 @dataclass
 class RequestStateStats:

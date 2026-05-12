@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable
+import os
 from typing import Any
 
 import torch
@@ -32,6 +33,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.offloading.worker import (
     OffloadingConnectorWorker,
 )
 from vllm.forward_context import ForwardContext
+from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.output import SchedulerOutput
@@ -39,6 +41,9 @@ from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.kv_offload.factory import OffloadingSpecFactory
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
+CXL_KV_DIAG = os.getenv("CXL_KV_DIAG") == "1"
 
 
 class OffloadingConnector(KVConnectorBase_V1):
@@ -56,6 +61,12 @@ class OffloadingConnector(KVConnectorBase_V1):
 
         assert kv_cache_config is not None
         spec = OffloadingSpecFactory.create_spec(vllm_config, kv_cache_config)
+
+        logger.warning(
+            "[2026-05-10] [CXL-KV-DIAG] "
+            "OffloadingConnector init role=%s, "
+            "preempt-save=ON, filter-bypass=ON",
+            role.name)
 
         self.connector_scheduler: OffloadingConnectorScheduler | None = None
         self.connector_worker: OffloadingConnectorWorker | None = None
