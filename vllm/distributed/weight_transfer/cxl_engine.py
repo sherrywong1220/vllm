@@ -73,6 +73,7 @@ class CXLWeightTransferEngine(
         self._store = None  # CanonicalWeightStore, opened lazily on first receive
         self._owner_names: list[str] = []
         self._cuda_direct = False  # True once the store is cudaHostRegister'd (P2 one-hop read)
+        self._pinned: dict[str, torch.Tensor] = {}  # two-hop fallback buffers
 
     def init_transfer_engine(self, init_info: CXLWeightTransferInitInfo) -> None:
         if not init_info.store_uri:
@@ -89,7 +90,10 @@ class CXLWeightTransferEngine(
         deadline = time.monotonic() + _OPEN_TIMEOUT_S
         while True:
             try:
-                self._store = CanonicalWeightStore.open(self._store_uri, readonly=True)
+                # readonly=False so the mmap is writable → cudaHostRegister-able for
+                # the one-hop read DMA. We never write through it (region_view reads
+                # only); RW is solely to permit host-registration.
+                self._store = CanonicalWeightStore.open(self._store_uri, readonly=False)
                 break
             except RuntimeError as e:
                 if time.monotonic() > deadline:
@@ -102,20 +106,31 @@ class CXLWeightTransferEngine(
             t.name for t in self._store.manifest.tensors if t.alias_of is None
         ]
         # P2 one-hop read: page-lock the store payload span so each tensor can DMA
-        # straight store->cuda (no pinned-CPU stage), reusing the P1B write-side
-        # mechanism on the read side. Fail loud if the region isn't detected pinned
-        # (else copy_(non_blocking) silently re-stages, defeating the one-hop).
+        # straight store->cuda (no pinned-CPU stage), reusing P1B's mechanism on the
+        # read side. Best-effort: if registration fails (e.g. the gpudirect WRITER
+        # already pinned the same shared /tmp pages, or a readonly mapping slipped
+        # through), fall back to the staged two-hop read — never crash the sync.
         if torch.cuda.is_available():
-            self._cuda_direct = self._store.register_host_for_cuda()
-            if self._cuda_direct and self._owner_names:
-                probe = self._store.region_view(
-                    self._store.active_slot, self._owner_names[0]
+            try:
+                ok = self._store.register_host_for_cuda()
+                probe_pinned = (
+                    ok
+                    and self._owner_names
+                    and self._store.region_view(
+                        self._store.active_slot, self._owner_names[0]
+                    ).is_pinned()
                 )
-                if not probe.is_pinned():
-                    raise RuntimeError(
-                        "P2 GPU-direct read: store region not pinned after "
-                        "cudaHostRegister — copy_(non_blocking) would re-stage."
-                    )
+                self._cuda_direct = bool(probe_pinned)
+            except RuntimeError as e:
+                logger.warning(
+                    "CXL GPU-direct read unavailable (%s) — staged two-hop read", e
+                )
+                self._cuda_direct = False
+        logger.info(
+            "CXL reader: gpu_direct=%s (%d owner tensors)",
+            self._cuda_direct,
+            len(self._owner_names),
+        )
 
     def receive_weights(
         self,
@@ -144,25 +159,42 @@ class CXLWeightTransferEngine(
         # wait_committed (flips only at the next commit, which the stop-the-world
         # sync defers). region_view is a zero-copy CPU view into the store mmap.
         slot = self._store.active_slot
+        if c2:
+            from shared_weight_store.digest import xor_digest_update
         t0 = time.perf_counter()
         for name in self._owner_names:
-            region = self._store.region_view(slot, name)
-            if c2:
-                from shared_weight_store.digest import xor_digest_update
-                digest = xor_digest_update(digest, name, region)
             if self._cuda_direct:
                 # One-hop DMA: registered (pinned) store region -> a fresh cuda
                 # tensor, no pinned-CPU stage. Same stream as load_weights below, so
                 # the non_blocking copy is ordered before the load reads it.
+                region = self._store.region_view(slot, name)
+                if c2:
+                    digest = xor_digest_update(digest, name, region)
                 tensor = torch.empty(region.shape, dtype=region.dtype, device="cuda")
                 tensor.copy_(region, non_blocking=True)
-            else:
-                tensor = region  # CPU-only (C1 / no-CUDA): hand the view to load
+                total_bytes += region.nbytes
+            elif use_cuda:
+                # Two-hop fallback (iter-7): store -> reused pinned CPU buffer -> H2D.
+                buf = self._pinned.get(name)
+                if buf is None:
+                    spec = next(t for t in self._store.manifest.tensors if t.name == name)
+                    buf = torch.empty(spec.shape, dtype=spec.dtype, device="cpu", pin_memory=True)
+                    self._pinned[name] = buf
+                self._store.read_tensor_into(version, name, buf)
+                if c2:
+                    digest = xor_digest_update(digest, name, buf)
+                tensor = buf.to("cuda", non_blocking=True)
+                total_bytes += buf.nbytes
+            else:  # CPU-only (C1 / no CUDA): hand the store view straight to load
+                region = self._store.region_view(slot, name)
+                if c2:
+                    digest = xor_digest_update(digest, name, region)
+                tensor = region
+                total_bytes += region.nbytes
             # Incremental load (one tensor) keeps peak host/device memory bounded
             # and matches the layerwise-reload contract (tensors arrive in manifest
             # = checkpoint order, so each layer's set completes in order).
             load_weights([(name, tensor)])
-            total_bytes += region.nbytes
         if use_cuda:
             torch.cuda.synchronize()
         if c2 and self._is_tp_rank0():
