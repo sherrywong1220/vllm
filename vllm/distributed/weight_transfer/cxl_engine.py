@@ -122,15 +122,12 @@ class CXLWeightTransferEngine(
                 )
                 self._cuda_direct = bool(probe_pinned)
             except RuntimeError as e:
-                logger.warning(
-                    "CXL GPU-direct read unavailable (%s) — staged two-hop read", e
-                )
+                print(f"[WT-CXL] GPU-direct read unavailable ({e}) — staged two-hop",
+                      flush=True)
                 self._cuda_direct = False
-        logger.info(
-            "CXL reader: gpu_direct=%s (%d owner tensors)",
-            self._cuda_direct,
-            len(self._owner_names),
-        )
+        if self._is_tp_rank0():
+            print(f"[WT-CXL] reader gpu_direct={self._cuda_direct} "
+                  f"({len(self._owner_names)} owner tensors)", flush=True)
 
     def receive_weights(
         self,
