@@ -21,6 +21,7 @@ The store is the persistent shared buffer; the trainer writes it via the
 so the ``trainer_send_weights`` static hook here is intentionally unused.
 """
 
+import os
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -121,6 +122,8 @@ class CXLWeightTransferEngine(
         self._store.wait_committed(min_version=version, timeout_s=_WAIT_TIMEOUT_S)
 
         use_cuda = torch.cuda.is_available()
+        c2 = os.environ.get("WT_CXL_C2", "0") == "1"  # anti-cheat digest oracle
+        digest = 0
         total_bytes = 0
         t0 = time.perf_counter()
         for name in self._owner_names:
@@ -130,6 +133,9 @@ class CXLWeightTransferEngine(
                 buf = torch.empty(spec.shape, dtype=spec.dtype, pin_memory=use_cuda)
                 self._pinned[name] = buf
             self._store.read_tensor_into(version, name, buf)
+            if c2:
+                from shared_weight_store.digest import xor_digest_update
+                digest = xor_digest_update(digest, name, buf)
             tensor = buf.to("cuda", non_blocking=True) if use_cuda else buf
             # Incremental load (one tensor) keeps peak host/device memory bounded
             # and matches the layerwise-reload contract (tensors arrive in manifest
@@ -138,6 +144,15 @@ class CXLWeightTransferEngine(
             total_bytes += buf.nbytes
         if use_cuda:
             torch.cuda.synchronize()
+        if c2 and self._is_tp_rank0():
+            # Mirrors the trainer's send digest (over full_tensor()); equal digests
+            # prove the per-worker store read reconstructed the canonical weights
+            # bitwise. One print from TP rank 0 (every worker reads the full model).
+            print(
+                f"[WT-CXL-C2] role=recv version={version} "
+                f"count={len(self._owner_names)} digest={digest:08x}",
+                flush=True,
+            )
         logger.info(
             "CXL receive_weights v%d: %.2f GB from %d tensors in %.2fs",
             version,
@@ -145,6 +160,15 @@ class CXLWeightTransferEngine(
             len(self._owner_names),
             time.perf_counter() - t0,
         )
+
+    @staticmethod
+    def _is_tp_rank0() -> bool:
+        try:
+            from vllm.distributed import get_tensor_model_parallel_rank
+
+            return get_tensor_model_parallel_rank() == 0
+        except Exception:
+            return True
 
     def shutdown(self) -> None:
         if self._store is not None:
