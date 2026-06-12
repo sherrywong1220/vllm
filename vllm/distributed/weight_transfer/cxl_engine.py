@@ -130,7 +130,13 @@ class CXLWeightTransferEngine(
             buf = self._pinned.get(name)
             if buf is None:
                 spec = next(t for t in self._store.manifest.tensors if t.name == name)
-                buf = torch.empty(spec.shape, dtype=spec.dtype, pin_memory=use_cuda)
+                # device="cpu" is REQUIRED: gpu_worker.update_weights runs us inside
+                # `with torch.device(cuda)` (layerwise reload), so without it
+                # torch.empty would target cuda and pin_memory raises "Only dense CPU
+                # tensors can be pinned".
+                buf = torch.empty(
+                    spec.shape, dtype=spec.dtype, device="cpu", pin_memory=use_cuda
+                )
                 self._pinned[name] = buf
             self._store.read_tensor_into(version, name, buf)
             if c2:
