@@ -120,3 +120,9 @@ WeightTransferEngineFactory.register_engine(
     "vllm.distributed.weight_transfer.ipc_engine",
     "IPCWeightTransferEngine",
 )
+
+WeightTransferEngineFactory.register_engine(
+    "cxl",
+    "vllm.distributed.weight_transfer.cxl_engine",
+    "CXLWeightTransferEngine",
+)
