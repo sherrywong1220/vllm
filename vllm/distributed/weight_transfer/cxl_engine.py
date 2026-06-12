@@ -72,7 +72,7 @@ class CXLWeightTransferEngine(
         self._store_uri: str | None = None
         self._store = None  # CanonicalWeightStore, opened lazily on first receive
         self._owner_names: list[str] = []
-        self._pinned: dict[str, torch.Tensor] = {}
+        self._cuda_direct = False  # True once the store is cudaHostRegister'd (P2 one-hop read)
 
     def init_transfer_engine(self, init_info: CXLWeightTransferInitInfo) -> None:
         if not init_info.store_uri:
@@ -101,6 +101,21 @@ class CXLWeightTransferEngine(
         self._owner_names = [
             t.name for t in self._store.manifest.tensors if t.alias_of is None
         ]
+        # P2 one-hop read: page-lock the store payload span so each tensor can DMA
+        # straight store->cuda (no pinned-CPU stage), reusing the P1B write-side
+        # mechanism on the read side. Fail loud if the region isn't detected pinned
+        # (else copy_(non_blocking) silently re-stages, defeating the one-hop).
+        if torch.cuda.is_available():
+            self._cuda_direct = self._store.register_host_for_cuda()
+            if self._cuda_direct and self._owner_names:
+                probe = self._store.region_view(
+                    self._store.active_slot, self._owner_names[0]
+                )
+                if not probe.is_pinned():
+                    raise RuntimeError(
+                        "P2 GPU-direct read: store region not pinned after "
+                        "cudaHostRegister — copy_(non_blocking) would re-stage."
+                    )
 
     def receive_weights(
         self,
@@ -125,29 +140,29 @@ class CXLWeightTransferEngine(
         c2 = os.environ.get("WT_CXL_C2", "0") == "1"  # anti-cheat digest oracle
         digest = 0
         total_bytes = 0
+        # The committed slot (1 - writing_slot); stable for a reader after
+        # wait_committed (flips only at the next commit, which the stop-the-world
+        # sync defers). region_view is a zero-copy CPU view into the store mmap.
+        slot = self._store.active_slot
         t0 = time.perf_counter()
         for name in self._owner_names:
-            buf = self._pinned.get(name)
-            if buf is None:
-                spec = next(t for t in self._store.manifest.tensors if t.name == name)
-                # device="cpu" is REQUIRED: gpu_worker.update_weights runs us inside
-                # `with torch.device(cuda)` (layerwise reload), so without it
-                # torch.empty would target cuda and pin_memory raises "Only dense CPU
-                # tensors can be pinned".
-                buf = torch.empty(
-                    spec.shape, dtype=spec.dtype, device="cpu", pin_memory=use_cuda
-                )
-                self._pinned[name] = buf
-            self._store.read_tensor_into(version, name, buf)
+            region = self._store.region_view(slot, name)
             if c2:
                 from shared_weight_store.digest import xor_digest_update
-                digest = xor_digest_update(digest, name, buf)
-            tensor = buf.to("cuda", non_blocking=True) if use_cuda else buf
+                digest = xor_digest_update(digest, name, region)
+            if self._cuda_direct:
+                # One-hop DMA: registered (pinned) store region -> a fresh cuda
+                # tensor, no pinned-CPU stage. Same stream as load_weights below, so
+                # the non_blocking copy is ordered before the load reads it.
+                tensor = torch.empty(region.shape, dtype=region.dtype, device="cuda")
+                tensor.copy_(region, non_blocking=True)
+            else:
+                tensor = region  # CPU-only (C1 / no-CUDA): hand the view to load
             # Incremental load (one tensor) keeps peak host/device memory bounded
             # and matches the layerwise-reload contract (tensors arrive in manifest
             # = checkpoint order, so each layer's set completes in order).
             load_weights([(name, tensor)])
-            total_bytes += buf.nbytes
+            total_bytes += region.nbytes
         if use_cuda:
             torch.cuda.synchronize()
         if c2 and self._is_tp_rank0():
