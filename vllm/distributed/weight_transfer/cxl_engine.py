@@ -74,6 +74,12 @@ class CXLWeightTransferEngine(
         self._owner_names: list[str] = []
         self._cuda_direct = False  # True once the store is cudaHostRegister'd (P2 one-hop read)
         self._pinned: dict[str, torch.Tensor] = {}  # two-hop fallback buffers
+        self._specs: dict = {}  # name -> TensorSpec (full shape) for P3A slice geometry
+        # P3A: read only this rank's ~1/TP slice (kill the over-read), reusing the
+        # vLLM loader via is_sharded_weight. Default OFF = the P2 full-read path.
+        # See claude_log/weight_sync/p3a_reuse_loader_decision.md.
+        self._tp_slice = os.environ.get("WT_CXL_TP_SLICE", "0") == "1"
+        self._plan: dict | None = None  # name -> (dim, start, size); built once on first receive
 
     def init_transfer_engine(self, init_info: CXLWeightTransferInitInfo) -> None:
         if not init_info.store_uri:
@@ -105,6 +111,7 @@ class CXLWeightTransferEngine(
         self._owner_names = [
             t.name for t in self._store.manifest.tensors if t.alias_of is None
         ]
+        self._specs = {t.name: t for t in self._store.manifest.tensors}  # full shapes (P3A)
         # P2 one-hop read: page-lock the store payload span so each tensor can DMA
         # straight store->cuda (no pinned-CPU stage), reusing P1B's mechanism on the
         # read side. Best-effort: if registration fails (e.g. the gpudirect WRITER
@@ -148,6 +155,13 @@ class CXLWeightTransferEngine(
         version = update_info.version
         self._store.wait_committed(min_version=version, timeout_s=_WAIT_TIMEOUT_S)
 
+        # P3A: build the TP-slice copy plan once. load_weights is model.load_weights
+        # (a bound method) on the checkpoint-format path, so __self__ is the live
+        # vLLM model we introspect for shard geometry + set is_sharded_weight on.
+        if self._tp_slice and self._plan is None:
+            self._build_plan(getattr(load_weights, "__self__", None))
+        plan = self._plan
+
         use_cuda = torch.cuda.is_available()
         c2 = os.environ.get("WT_CXL_C2", "0") == "1"  # anti-cheat digest oracle
         digest = 0
@@ -160,7 +174,22 @@ class CXLWeightTransferEngine(
             from shared_weight_store.digest import xor_digest_update
         t0 = time.perf_counter()
         for name in self._owner_names:
-            if self._cuda_direct:
+            entry = plan.get(name) if plan else None
+            if entry is not None:
+                # P3A reuse-path: read ONLY this rank's slice from the store. The
+                # loader skips its narrow (is_sharded_weight, set in _build_plan) but
+                # still does fused placement + quant repack — so we move full/TP bytes.
+                dim, start, size = entry
+                sl = self._store.region_view(slot, name).narrow(dim, start, size)
+                if c2:
+                    digest = xor_digest_update(digest, name, sl.contiguous())
+                if use_cuda:
+                    tensor = torch.empty(tuple(sl.shape), dtype=sl.dtype, device="cuda")
+                    tensor.copy_(sl, non_blocking=True)
+                else:
+                    tensor = sl.contiguous()
+                total_bytes += sl.numel() * sl.element_size()
+            elif self._cuda_direct:
                 # One-hop DMA: registered (pinned) store region -> a fresh cuda
                 # tensor, no pinned-CPU stage. Same stream as load_weights below, so
                 # the non_blocking copy is ordered before the load reads it.
@@ -195,11 +224,15 @@ class CXLWeightTransferEngine(
         if use_cuda:
             torch.cuda.synchronize()
         if c2 and self._is_tp_rank0():
-            # Mirrors the trainer's send digest (over full_tensor()); equal digests
-            # prove the per-worker store read reconstructed the canonical weights
-            # bitwise. One print from TP rank 0 (every worker reads the full model).
+            # Full-read path: digest == the trainer's send digest (over full_tensor())
+            # proves the per-worker store read reconstructed the canonical weights
+            # bitwise. Slice path: this rank only read its slice, so the digest is NOT
+            # comparable to send-over-full — labelled role=recv-sliced and excluded
+            # from the equality oracle (its bitwise gate is C1b test_slice_plan; its
+            # runtime oracle is generation-match). One print from TP rank 0.
+            role = "recv-sliced" if plan else "recv"
             print(
-                f"[WT-CXL-C2] role=recv version={version} "
+                f"[WT-CXL-C2] role={role} version={version} "
                 f"count={len(self._owner_names)} digest={digest:08x}",
                 flush=True,
             )
@@ -210,6 +243,74 @@ class CXLWeightTransferEngine(
             len(self._owner_names),
             time.perf_counter() - t0,
         )
+
+    def _build_plan(self, model) -> None:
+        """Classify each store owner tensor and build the per-rank slice plan.
+
+        P3A-1 scope: only **pure row-parallel** weights (sharded on ``input_dim``,
+        e.g. ``o_proj``/``down_proj``) — the lowest-corruption-risk class. Their
+        slice is an even shard ``even_shard(full_dim, tp_rank, tp_size)`` and the
+        model param is marked ``is_sharded_weight=True`` so the loader skips its own
+        narrow but still copies our pre-sliced bytes into the param (C1b-verified).
+
+        Everything else — fused checkpoint names not present as a model param
+        (qkv/gate_up → P3A-2/3), column/vocab-parallel, quantized, or any param we
+        cannot classify — gets NO plan entry and rides the unchanged P2 full read
+        (P3D coverage). So the reader never silently mis-slices.
+        """
+        from shared_weight_store.slice_plan import even_shard
+
+        if model is None:
+            # Non-checkpoint-format caller (no bound model) — never slice.
+            self._plan = {}
+            return
+        try:
+            from vllm.distributed import (
+                get_tensor_model_parallel_rank,
+                get_tensor_model_parallel_world_size,
+            )
+
+            tp_rank = get_tensor_model_parallel_rank()
+            tp_size = get_tensor_model_parallel_world_size()
+        except Exception:
+            tp_rank, tp_size = 0, 1
+
+        params = dict(model.named_parameters())
+        plan: dict = {}
+        for name in self._owner_names:
+            if tp_size <= 1:
+                continue  # TP=1: no over-read, nothing to slice
+            p = params.get(name)
+            if p is None:
+                continue  # fused checkpoint name (qkv/gate_up) — P3A-2/3
+            # Quantized / bitsandbytes must go through the framework loader (P3D).
+            if getattr(p, "use_bitsandbytes_4bit", False):
+                continue
+            if getattr(p, "packed_dim", None) is not None:
+                continue
+            input_dim = getattr(p, "input_dim", None)
+            output_dim = getattr(p, "output_dim", None)
+            # P3A-1: pure row-parallel only (sharded on input_dim, not output_dim).
+            if input_dim is None or output_dim is not None:
+                continue
+            spec = self._specs.get(name)
+            if spec is None:
+                continue
+            try:
+                start, size = even_shard(spec.shape[input_dim], tp_rank, tp_size)
+            except ValueError:
+                continue  # indivisible dim → fall back to full read
+            plan[name] = (input_dim, start, size)
+            # Tell vLLM's loader this tensor is already this rank's shard (skip narrow).
+            setattr(p, "is_sharded_weight", True)
+
+        self._plan = plan
+        if self._is_tp_rank0():
+            print(
+                f"[WT-CXL] P3A tp-slice plan: {len(plan)}/{len(self._owner_names)} "
+                f"tensors sliced (row-parallel), rest full-read (rank {tp_rank}/{tp_size})",
+                flush=True,
+            )
 
     @staticmethod
     def _is_tp_rank0() -> bool:
