@@ -258,7 +258,7 @@ class CXLWeightTransferEngine(
         cannot classify — gets NO plan entry and rides the unchanged P2 full read
         (P3D coverage). So the reader never silently mis-slices.
         """
-        from shared_weight_store.slice_plan import even_shard
+        from shared_weight_store.slice_plan import row_slice_plan
 
         if model is None:
             # Non-checkpoint-format caller (no bound model) — never slice.
@@ -284,23 +284,22 @@ class CXLWeightTransferEngine(
             if p is None:
                 continue  # fused checkpoint name (qkv/gate_up) — P3A-2/3
             # Quantized / bitsandbytes must go through the framework loader (P3D).
+            # Quantized / bitsandbytes must go through the framework loader (P3D).
             if getattr(p, "use_bitsandbytes_4bit", False):
                 continue
             if getattr(p, "packed_dim", None) is not None:
                 continue
-            input_dim = getattr(p, "input_dim", None)
-            output_dim = getattr(p, "output_dim", None)
-            # P3A-1: pure row-parallel only (sharded on input_dim, not output_dim).
-            if input_dim is None or output_dim is not None:
+            # Must be a parallel linear weight the loader narrows + honours
+            # is_sharded_weight on (input_dim present on every ModelWeightParameter).
+            if getattr(p, "input_dim", None) is None:
                 continue
             spec = self._specs.get(name)
             if spec is None:
                 continue
-            try:
-                start, size = even_shard(spec.shape[input_dim], tp_rank, tp_size)
-            except ValueError:
-                continue  # indivisible dim → fall back to full read
-            plan[name] = (input_dim, start, size)
+            entry = row_slice_plan(tuple(spec.shape), tuple(p.shape), tp_rank, tp_size)
+            if entry is None:
+                continue  # not an evenly-sharded 2D row weight → unchanged full read
+            plan[name] = entry
             # Tell vLLM's loader this tensor is already this rank's shard (skip narrow).
             setattr(p, "is_sharded_weight", True)
 
