@@ -146,10 +146,14 @@ class _ColumnvLLMParameter(BasevLLMParameter):
         return self._output_dim
 
     def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
+        # wt_cxl P3A: is_sharded_weight => loaded_weight is ALREADY this rank's slice
+        # (read pre-sliced from the canonical store); skip the per-rank narrow but keep
+        # the copy. Mirrors the v1 linear.py hook; default-off, no effect on normal loads.
         shard_size = self.data.shape[self.output_dim]
-        loaded_weight = loaded_weight.narrow(
-            self.output_dim, self.tp_rank * shard_size, shard_size
-        )
+        if not getattr(self, "is_sharded_weight", False):
+            loaded_weight = loaded_weight.narrow(
+                self.output_dim, self.tp_rank * shard_size, shard_size
+            )
         assert self.data.shape == loaded_weight.shape
         self.data.copy_(loaded_weight)
 
@@ -168,10 +172,14 @@ class _ColumnvLLMParameter(BasevLLMParameter):
 
         param_data = self.data
 
+        # Keep the fused placement narrow (where this shard_id lives in the merged
+        # param). wt_cxl P3A: is_sharded_weight => loaded_weight is already this rank's
+        # column slice of this shard_id, so skip the per-rank narrow but keep placement.
         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
-        loaded_weight = loaded_weight.narrow(
-            self.output_dim, self.tp_rank * shard_size, shard_size
-        )
+        if not getattr(self, "is_sharded_weight", False):
+            loaded_weight = loaded_weight.narrow(
+                self.output_dim, self.tp_rank * shard_size, shard_size
+            )
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
 
@@ -192,10 +200,15 @@ class _ColumnvLLMParameter(BasevLLMParameter):
 
         param_data = self.data
         shard_id_int = self.tp_rank if shard_id == "q" else self.tp_rank // num_heads
+        # Keep the fused-QKV placement narrow (q/k/v offset in the merged param).
+        # wt_cxl P3A: is_sharded_weight => loaded_weight is already this rank's column
+        # slice (incl. the GQA shard_id_int//num_heads rule applied reader-side), so
+        # skip the per-rank narrow but keep placement.
         param_data = param_data.narrow(self.output_dim, shard_offset, shard_size)
-        loaded_weight = loaded_weight.narrow(
-            self.output_dim, shard_id_int * shard_size, shard_size
-        )
+        if not getattr(self, "is_sharded_weight", False):
+            loaded_weight = loaded_weight.narrow(
+                self.output_dim, shard_id_int * shard_size, shard_size
+            )
 
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
@@ -218,10 +231,14 @@ class RowvLLMParameter(BasevLLMParameter):
         return self._input_dim
 
     def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
+        # wt_cxl P3A: is_sharded_weight => loaded_weight is ALREADY this rank's input
+        # slice (read pre-sliced from the canonical store); skip the per-rank narrow but
+        # keep the copy. Mirrors the v1 linear.py hook; default-off, no normal-load effect.
         shard_size = self.data.shape[self.input_dim]
-        loaded_weight = loaded_weight.narrow(
-            self.input_dim, self.tp_rank * shard_size, shard_size
-        )
+        if not getattr(self, "is_sharded_weight", False):
+            loaded_weight = loaded_weight.narrow(
+                self.input_dim, self.tp_rank * shard_size, shard_size
+            )
 
         if len(loaded_weight.shape) == 0:
             loaded_weight = loaded_weight.reshape(1)
