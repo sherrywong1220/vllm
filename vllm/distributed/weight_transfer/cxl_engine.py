@@ -92,6 +92,9 @@ class CXLWeightTransferEngine(
             return
         # Imported lazily so a non-RL vLLM install doesn't need the store library.
         from shared_weight_store import CanonicalWeightStore
+        from shared_weight_store.gpu_h2d import slice_h2d
+
+        self._slice_h2d = slice_h2d  # guarded pitched-DMA / copy_ for slice reads (P3A)
 
         deadline = time.monotonic() + _OPEN_TIMEOUT_S
         while True:
@@ -185,7 +188,10 @@ class CXLWeightTransferEngine(
                     digest = xor_digest_update(digest, name, sl.contiguous())
                 if use_cuda:
                     tensor = torch.empty(tuple(sl.shape), dtype=sl.dtype, device="cuda")
-                    tensor.copy_(sl, non_blocking=True)
+                    # Guarded H2D: strided (row) slice -> cudaMemcpy2DAsync (pitched DMA,
+                    # 5-20x over torch's strided copy_); contiguous (column) slice or any
+                    # dtype-mismatch -> copy_ (keeps auto-cast). See gpu_h2d.slice_h2d.
+                    self._slice_h2d(sl, tensor)
                 else:
                     tensor = sl.contiguous()
                 total_bytes += sl.numel() * sl.element_size()
