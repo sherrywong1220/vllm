@@ -12,4 +12,4 @@ class WeightTransferConfig:
     backend: Literal["nccl", "ipc", "cxl"] = "nccl"
     """The backend to use for weight transfer. "cxl" reads each TP worker's weights
     directly from a shared canonical weight store (mmap/CXL), bypassing the NCCL
-    broadcast and the IPC bucket funnel."""
+    broadcast and the per-GPU bucket IPC hop."""

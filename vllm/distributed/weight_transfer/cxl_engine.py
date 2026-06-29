@@ -6,10 +6,12 @@ P2 of the wt_cxl canonical-store curriculum. Each vLLM TP worker reads the
 committed model version DIRECTLY from a shared canonical weight store (an
 mmap-backed `shared_weight_store` library, on `/tmp` today, a CXL DAX device
 later) and feeds the tensors into ``model.load_weights`` itself — eliminating
-veRL's ``BucketedWeightSender`` leader funnel (the leader reading the full model
-and re-distributing it to TP workers over ZMQ/IPC, serialized one bucket at a
-time, was the entire 7B read cost: G2=3.04s of D4d=3.12s, while the load itself
-is 0.1s).
+veRL's ``BucketedWeightSender`` per-GPU IPC hop. (That hop is NOT a single leader
+funnel: ``update_weights`` is ``Dispatch.ONE_TO_ALL`` so every rank sends the full
+model to its co-located vLLM worker over its OWN per-GPU ZMQ/IPC socket, serialized
+one bucket at a time — N parallel per-GPU transfers, each with per-bucket ack + a
+CE→IPC→vLLM double-hop. It was the entire 7B read cost: G2=3.04s of D4d=3.12s, while
+the load itself is 0.1s.)
 
 P2 uses ``is_checkpoint_format=True``: each worker reads the full canonical
 tensor and vLLM's existing per-parameter ``weight_loader``s slice it for this
@@ -146,7 +148,7 @@ class CXLWeightTransferEngine(
     ) -> None:
         """Read this version's canonical tensors from the shared store and load
         them incrementally. Each worker reads independently (the store mmap pages
-        are shared → page-cache hits, not N physical reads); no leader funnel.
+        are shared → page-cache hits, not N physical reads); no per-GPU ZMQ/IPC hop.
 
         ``load_weights`` is vLLM's ``model.load_weights`` (checkpoint format): it
         applies fused-QKV/gate-up remapping and narrows each tensor to this TP
