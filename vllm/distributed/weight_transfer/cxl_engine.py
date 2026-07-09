@@ -255,18 +255,20 @@ class CXLWeightTransferEngine(
     def _build_plan(self, model) -> None:
         """Classify each store owner tensor and build the per-rank slice plan.
 
-        P3A-1 scope: only **pure row-parallel** weights (sharded on ``input_dim``,
-        e.g. ``o_proj``/``down_proj``) — the lowest-corruption-risk class. Their
-        slice is an even shard ``even_shard(full_dim, tp_rank, tp_size)`` and the
-        model param is marked ``is_sharded_weight=True`` so the loader skips its own
-        narrow but still copies our pre-sliced bytes into the param (C1b-verified).
+        Two classes are sliced (each ``is_sharded_weight``-marked so the loader skips
+        only its per-rank narrow but keeps fused placement + quant repack — C1b-verified):
 
-        Everything else — fused checkpoint names not present as a model param
-        (qkv/gate_up → P3A-2/3), column/vocab-parallel, quantized, or any param we
-        cannot classify — gets NO plan entry and rides the unchanged P2 full read
-        (P3D coverage). So the reader never silently mis-slices.
+        * **P3A-1 pure row-parallel** (``o_proj``/``down_proj``): a direct model param,
+          sharded on ``input_dim``, classified by shape delta → strided dim-1 slice.
+        * **P3A-2 merged-column** (``gate_up_proj``): the store owner is the *unfused*
+          constituent (``gate_proj``/``up_proj``), NOT a model param, so it is mapped to
+          the fused param via ``packed_modules_mapping`` → contiguous dim-0 column slice.
+
+        Everything else — ``qkv_proj`` (→ P3A-3), vocab-parallel (→ P3A-4), quantized,
+        or any param we cannot classify — gets NO plan entry and rides the unchanged P2
+        full read (P3D coverage). So the reader never silently mis-slices.
         """
-        from shared_weight_store.slice_plan import row_slice_plan
+        from shared_weight_store.slice_plan import column_slice_plan, row_slice_plan
 
         if model is None:
             # Non-checkpoint-format caller (no bound model) — never slice.
@@ -285,39 +287,89 @@ class CXLWeightTransferEngine(
 
         params = dict(model.named_parameters())
         plan: dict = {}
+        n_row = n_col = 0
         for name in self._owner_names:
             if tp_size <= 1:
                 continue  # TP=1: no over-read, nothing to slice
-            p = params.get(name)
-            if p is None:
-                continue  # fused checkpoint name (qkv/gate_up) — P3A-2/3
-            # Quantized / bitsandbytes must go through the framework loader (P3D).
-            # Quantized / bitsandbytes must go through the framework loader (P3D).
-            if getattr(p, "use_bitsandbytes_4bit", False):
-                continue
-            if getattr(p, "packed_dim", None) is not None:
-                continue
-            # Must be a parallel linear weight the loader narrows + honours
-            # is_sharded_weight on (input_dim present on every ModelWeightParameter).
-            if getattr(p, "input_dim", None) is None:
-                continue
             spec = self._specs.get(name)
             if spec is None:
                 continue
-            entry = row_slice_plan(tuple(spec.shape), tuple(p.shape), tp_rank, tp_size)
+
+            p = params.get(name)
+            if p is not None:
+                # P3A-1: direct model param → pure row-parallel (o_proj/down_proj),
+                # classified by shape delta. Must be a parallel linear weight the
+                # loader narrows + honours is_sharded_weight on (input_dim present on
+                # every ModelWeightParameter); column/vocab/replicated → None → full.
+                if not self._sliceable(p) or getattr(p, "input_dim", None) is None:
+                    continue
+                entry = row_slice_plan(
+                    tuple(spec.shape), tuple(p.shape), tp_rank, tp_size
+                )
+                if entry is None:
+                    continue  # not an evenly-sharded 2D row weight → full read
+                plan[name] = entry
+                setattr(p, "is_sharded_weight", True)  # loader skips its narrow
+                n_row += 1
+                continue
+
+            # P3A-2: fused checkpoint name — the store owner is an UNFUSED constituent
+            # (gate_proj/up_proj), not a model param. Map it to the fused merged-column
+            # param (gate_up_proj) via packed_modules_mapping and take its CONTIGUOUS
+            # dim-0 column slice. qkv_proj is excluded here (returns None → full read,
+            # P3A-3). The loader still does fused PLACEMENT; is_sharded_weight only
+            # skips its per-rank narrow (v2 load_merged_column_weight; C1b-verified).
+            fused = self._merged_column_target(model, name, params)
+            if fused is None:
+                continue
+            if not self._sliceable(fused) or getattr(fused, "output_dim", None) is None:
+                continue
+            entry = column_slice_plan(tuple(spec.shape), tp_rank, tp_size)
             if entry is None:
-                continue  # not an evenly-sharded 2D row weight → unchanged full read
+                continue
             plan[name] = entry
-            # Tell vLLM's loader this tensor is already this rank's shard (skip narrow).
-            setattr(p, "is_sharded_weight", True)
+            setattr(fused, "is_sharded_weight", True)  # on the fused param (idempotent)
+            n_col += 1
 
         self._plan = plan
         if self._is_tp_rank0():
             print(
                 f"[WT-CXL] P3A tp-slice plan: {len(plan)}/{len(self._owner_names)} "
-                f"tensors sliced (row-parallel), rest full-read (rank {tp_rank}/{tp_size})",
+                f"tensors sliced ({n_row} row-parallel + {n_col} merged-column), "
+                f"rest full-read (rank {tp_rank}/{tp_size})",
                 flush=True,
             )
+
+    @staticmethod
+    def _sliceable(p) -> bool:
+        """A param is TP-sliceable only if unquantized/unpacked — quantized (GPTQ/AWQ/
+        Marlin/FP8) and bitsandbytes params carry a kernel-tiled/packed layout whose
+        shape differs from the logical one for reasons unrelated to TP, so they must go
+        through the framework loader + ``process_weights_after_loading`` (P3D)."""
+        return (
+            not getattr(p, "use_bitsandbytes_4bit", False)
+            and getattr(p, "packed_dim", None) is None
+        )
+
+    @staticmethod
+    def _merged_column_target(model, name, params):
+        """If store owner ``name`` is an unfused constituent of the merged-COLUMN fused
+        param ``gate_up_proj`` (2 plain column shards, no GQA replicas), return the
+        fused model param; else ``None``.
+
+        ``qkv_proj`` is deliberately EXCLUDED — its k/v shards use the GQA
+        ``num_kv_head_replicas`` rule (P3A-3), not an even column split. Keyed on the
+        literal ``gate_up_proj`` mapping (the campaign Qwen2/Llama name); a model that
+        does not expose it simply returns ``None`` → unchanged full read."""
+        mapping = getattr(model, "packed_modules_mapping", None) or {}
+        constituents = mapping.get("gate_up_proj")
+        if not constituents:
+            return None
+        for c in constituents:
+            needle = f".{c}."
+            if needle in name:
+                return params.get(name.replace(needle, ".gate_up_proj."))
+        return None
 
     @staticmethod
     def _is_tp_rank0() -> bool:
