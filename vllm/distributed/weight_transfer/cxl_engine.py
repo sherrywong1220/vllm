@@ -263,12 +263,19 @@ class CXLWeightTransferEngine(
         * **P3A-2 merged-column** (``gate_up_proj``): the store owner is the *unfused*
           constituent (``gate_proj``/``up_proj``), NOT a model param, so it is mapped to
           the fused param via ``packed_modules_mapping`` → contiguous dim-0 column slice.
+        * **P3A-3 fused-QKV** (``qkv_proj``): unfused ``q_proj``/``k_proj``/``v_proj``
+          mapped to the fused param + its ``QKVParallelLinear`` module → contiguous dim-0
+          slice with the **GQA ``num_kv_head_replicas``** rule for k/v (read off the module).
 
-        Everything else — ``qkv_proj`` (→ P3A-3), vocab-parallel (→ P3A-4), quantized,
-        or any param we cannot classify — gets NO plan entry and rides the unchanged P2
-        full read (P3D coverage). So the reader never silently mis-slices.
+        Everything else — vocab-parallel (→ P3A-4), quantized, or any param we cannot
+        classify — gets NO plan entry and rides the unchanged P2 full read (P3D coverage).
+        So the reader never silently mis-slices.
         """
-        from shared_weight_store.slice_plan import column_slice_plan, row_slice_plan
+        from shared_weight_store.slice_plan import (
+            column_slice_plan,
+            qkv_slice_plan,
+            row_slice_plan,
+        )
 
         if model is None:
             # Non-checkpoint-format caller (no bound model) — never slice.
@@ -286,8 +293,11 @@ class CXLWeightTransferEngine(
             tp_rank, tp_size = 0, 1
 
         params = dict(model.named_parameters())
+        # P3A-3 needs the QKVParallelLinear module (GQA geometry lives on the module,
+        # not the param); built once, plan is cached after.
+        modules = dict(model.named_modules())
         plan: dict = {}
-        n_row = n_col = 0
+        n_row = n_col = n_qkv = 0
         for name in self._owner_names:
             if tp_size <= 1:
                 continue  # TP=1: no over-read, nothing to slice
@@ -316,27 +326,50 @@ class CXLWeightTransferEngine(
             # P3A-2: fused checkpoint name — the store owner is an UNFUSED constituent
             # (gate_proj/up_proj), not a model param. Map it to the fused merged-column
             # param (gate_up_proj) via packed_modules_mapping and take its CONTIGUOUS
-            # dim-0 column slice. qkv_proj is excluded here (returns None → full read,
-            # P3A-3). The loader still does fused PLACEMENT; is_sharded_weight only
-            # skips its per-rank narrow (v2 load_merged_column_weight; C1b-verified).
+            # dim-0 column slice. The loader still does fused PLACEMENT; is_sharded_weight
+            # only skips its per-rank narrow (v2 load_merged_column_weight; C1b-verified).
             fused = self._merged_column_target(model, name, params)
-            if fused is None:
+            if fused is not None:
+                if not self._sliceable(fused) or getattr(fused, "output_dim", None) is None:
+                    continue
+                entry = column_slice_plan(tuple(spec.shape), tp_rank, tp_size)
+                if entry is None:
+                    continue
+                plan[name] = entry
+                setattr(fused, "is_sharded_weight", True)  # on the fused param (idempotent)
+                n_col += 1
                 continue
-            if not self._sliceable(fused) or getattr(fused, "output_dim", None) is None:
+
+            # P3A-3: fused-QKV — store owner is unfused q/k/v; map to the fused qkv_proj
+            # param AND its QKVParallelLinear module (the GQA num_kv_head_replicas geometry
+            # is on the module, not the param). Contiguous dim-0 slice with the GQA replica
+            # rule (v2 load_qkv_weight keeps fused placement; C1b-verified incl. replicas=2).
+            qkv = self._qkv_target(model, name, params, modules)
+            if qkv is None:
                 continue
-            entry = column_slice_plan(tuple(spec.shape), tp_rank, tp_size)
+            fused_p, shard_id, qkv_mod = qkv
+            if not self._sliceable(fused_p) or getattr(fused_p, "output_dim", None) is None:
+                continue
+            if not hasattr(qkv_mod, "num_kv_head_replicas"):
+                continue  # not a QKVParallelLinear-like module → full read (P3D)
+            entry = qkv_slice_plan(
+                shard_id, tp_rank, tp_size,
+                qkv_mod.num_heads, qkv_mod.num_kv_heads, qkv_mod.head_size,
+                getattr(qkv_mod, "v_head_size", qkv_mod.head_size),
+                qkv_mod.num_kv_head_replicas,
+            )
             if entry is None:
                 continue
             plan[name] = entry
-            setattr(fused, "is_sharded_weight", True)  # on the fused param (idempotent)
-            n_col += 1
+            setattr(fused_p, "is_sharded_weight", True)  # on the fused param (idempotent)
+            n_qkv += 1
 
         self._plan = plan
         if self._is_tp_rank0():
             print(
                 f"[WT-CXL] P3A tp-slice plan: {len(plan)}/{len(self._owner_names)} "
-                f"tensors sliced ({n_row} row-parallel + {n_col} merged-column), "
-                f"rest full-read (rank {tp_rank}/{tp_size})",
+                f"tensors sliced ({n_row} row-parallel + {n_col} merged-column + "
+                f"{n_qkv} qkv), rest full-read (rank {tp_rank}/{tp_size})",
                 flush=True,
             )
 
@@ -369,6 +402,34 @@ class CXLWeightTransferEngine(
             needle = f".{c}."
             if needle in name:
                 return params.get(name.replace(needle, ".gate_up_proj."))
+        return None
+
+    @staticmethod
+    def _qkv_target(model, name, params, modules):
+        """If store owner ``name`` is an unfused q/k/v constituent of a fused
+        ``qkv_proj``, return ``(fused_param, shard_id, qkv_module)``; else ``None``.
+
+        ``shard_id`` ∈ {``q``,``k``,``v``} by position in
+        ``packed_modules_mapping['qkv_proj']``. The **module** is returned (not just the
+        param) because the GQA geometry (``num_kv_head_replicas``, per-rank
+        ``num_heads``/``num_kv_heads``, ``head_size``) that P3A-3 needs lives on the
+        ``QKVParallelLinear`` module, not on the param."""
+        mapping = getattr(model, "packed_modules_mapping", None) or {}
+        constituents = mapping.get("qkv_proj")
+        if not constituents:
+            return None
+        shard_ids = ("q", "k", "v")
+        for i, c in enumerate(constituents):
+            needle = f".{c}."
+            if needle in name and i < len(shard_ids):
+                fused_name = name.replace(needle, ".qkv_proj.")
+                fused_p = params.get(fused_name)
+                if fused_p is None or not fused_name.endswith(".weight"):
+                    return None
+                module = modules.get(fused_name[: -len(".weight")])
+                if module is None:
+                    return None
+                return fused_p, shard_ids[i], module
         return None
 
     @staticmethod
