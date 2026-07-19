@@ -188,12 +188,27 @@ class CXLWeightTransferEngine(
                 sl = self._store.region_view(slot, name).narrow(dim, start, size)
                 if c2:
                     digest = xor_digest_update(digest, name, sl.contiguous())
-                if use_cuda:
+                if use_cuda and self._cuda_direct:
+                    # Fast path: the store region is host-REGISTERED (pinned), so DMA
+                    # straight from it. Guarded H2D: strided (row) slice ->
+                    # cudaMemcpy2DAsync (pitched DMA, 5-20x over torch's strided copy_);
+                    # contiguous (column/vocab/qkv) slice or dtype-mismatch -> copy_
+                    # (keeps auto-cast). See gpu_h2d.slice_h2d.
                     tensor = torch.empty(tuple(sl.shape), dtype=sl.dtype, device="cuda")
-                    # Guarded H2D: strided (row) slice -> cudaMemcpy2DAsync (pitched DMA,
-                    # 5-20x over torch's strided copy_); contiguous (column) slice or any
-                    # dtype-mismatch -> copy_ (keeps auto-cast). See gpu_h2d.slice_h2d.
                     self._slice_h2d(sl, tensor)
+                elif use_cuda:
+                    # Store NOT host-registered (cudaHostRegister unavailable on this
+                    # node — gpu_direct=False). A DIRECT H2D from the non-pinned,
+                    # file-backed mmap region can fail (cudaErrorInvalidValue), so stage
+                    # the slice through a normal pinned CPU buffer first (copy_ gathers a
+                    # strided row slice on the CPU), then H2D — the same two-hop
+                    # robustness the full-read path uses below. Slower, but only on an
+                    # already-degraded no-GPU-direct node; the perf verdict runs pinned.
+                    staged = torch.empty(
+                        tuple(sl.shape), dtype=sl.dtype, device="cpu", pin_memory=True
+                    )
+                    staged.copy_(sl)
+                    tensor = staged.to("cuda", non_blocking=True)
                 else:
                     tensor = sl.contiguous()
                 total_bytes += sl.numel() * sl.element_size()
@@ -266,15 +281,21 @@ class CXLWeightTransferEngine(
         * **P3A-3 fused-QKV** (``qkv_proj``): unfused ``q_proj``/``k_proj``/``v_proj``
           mapped to the fused param + its ``QKVParallelLinear`` module → contiguous dim-0
           slice with the **GQA ``num_kv_head_replicas``** rule for k/v (read off the module).
+        * **P3A-4 vocab-parallel** (``embed_tokens``/``lm_head``): a direct
+          ``VocabParallelEmbedding`` param → contiguous dim-0 slice on the **padded** vocab
+          dim, using ``[org_vocab_start_index, org_vocab_end_index)`` read off the module's
+          ``shard_indices`` (NOT an even shard — vocab padding; the extended loader keeps
+          the partition zero-fill). C1b-verified incl. a padded / zero-org-row rank.
 
-        Everything else — vocab-parallel (→ P3A-4), quantized, or any param we cannot
-        classify — gets NO plan entry and rides the unchanged P2 full read (P3D coverage).
-        So the reader never silently mis-slices.
+        Everything else — quantized/packed, or any param we cannot classify — gets NO plan
+        entry and rides the unchanged P2 full read (P3D coverage). So the reader never
+        silently mis-slices.
         """
         from shared_weight_store.slice_plan import (
             column_slice_plan,
             qkv_slice_plan,
             row_slice_plan,
+            vocab_slice_plan,
         )
 
         if model is None:
@@ -297,7 +318,7 @@ class CXLWeightTransferEngine(
         # not the param); built once, plan is cached after.
         modules = dict(model.named_modules())
         plan: dict = {}
-        n_row = n_col = n_qkv = 0
+        n_row = n_col = n_qkv = n_vocab = 0
         for name in self._owner_names:
             if tp_size <= 1:
                 continue  # TP=1: no over-read, nothing to slice
@@ -307,10 +328,26 @@ class CXLWeightTransferEngine(
 
             p = params.get(name)
             if p is not None:
+                # P3A-4: vocab-parallel (embed_tokens/lm_head) — a direct model param
+                # sharded on the padded vocab dim by VocabParallelEmbedding. Intercepted
+                # BEFORE the row branch: the slice is [org_vocab_start_index,
+                # org_vocab_end_index) read off the live module's shard_indices, NOT an
+                # even shard (vocab padding; see p3a4_vocab_slice_design.md §3.2). The
+                # loader (extended to honour is_sharded_weight) keeps the padding
+                # zero-fill; is_sharded_weight only skips its per-rank narrow.
+                if self._sliceable(p):
+                    vgeom = self._vocab_target(name, p, modules)
+                    if vgeom is not None:
+                        ventry = vocab_slice_plan(*vgeom)
+                        if ventry is not None:
+                            plan[name] = ventry
+                            setattr(p, "is_sharded_weight", True)
+                            n_vocab += 1
+                            continue
                 # P3A-1: direct model param → pure row-parallel (o_proj/down_proj),
                 # classified by shape delta. Must be a parallel linear weight the
                 # loader narrows + honours is_sharded_weight on (input_dim present on
-                # every ModelWeightParameter); column/vocab/replicated → None → full.
+                # every ModelWeightParameter); column/replicated → None → full.
                 if not self._sliceable(p) or getattr(p, "input_dim", None) is None:
                     continue
                 entry = row_slice_plan(
@@ -369,7 +406,8 @@ class CXLWeightTransferEngine(
             print(
                 f"[WT-CXL] P3A tp-slice plan: {len(plan)}/{len(self._owner_names)} "
                 f"tensors sliced ({n_row} row-parallel + {n_col} merged-column + "
-                f"{n_qkv} qkv), rest full-read (rank {tp_rank}/{tp_size})",
+                f"{n_qkv} qkv + {n_vocab} vocab), rest full-read "
+                f"(rank {tp_rank}/{tp_size})",
                 flush=True,
             )
 
@@ -431,6 +469,38 @@ class CXLWeightTransferEngine(
                     return None
                 return fused_p, shard_ids[i], module
         return None
+
+    @staticmethod
+    def _vocab_target(name, param, modules):
+        """If store owner ``name`` is a vocab-parallel weight (``embed_tokens``/
+        ``lm_head`` on a ``VocabParallelEmbedding`` module), return the geometry
+        ``(org_vocab_start_index, org_vocab_end_index, num_embeddings_per_partition)``
+        for :func:`vocab_slice_plan`; else ``None`` (→ unchanged full read, P3D).
+
+        The boundaries are read off the live module's ``shard_indices`` — the single
+        source of truth for the **padded** vocab layout. They are NOT ``even_shard`` of
+        the vocab: vLLM shards the padded dim then min's the org boundaries down, so a
+        rank near the padding boundary owns fewer (or zero) org rows (see
+        p3a4_vocab_slice_design.md §3.2). Duck-typed on ``shard_indices`` +
+        ``num_embeddings_per_partition`` (no ``isinstance`` coupling); a module lacking
+        them (e.g. a row/column linear) returns ``None`` and falls through."""
+        if getattr(param, "output_dim", None) is None:
+            return None  # replicated / no shardable output dim → full read
+        if not name.endswith(".weight"):
+            return None
+        module = modules.get(name[: -len(".weight")])
+        si = getattr(module, "shard_indices", None)
+        part = getattr(module, "num_embeddings_per_partition", None)
+        if si is None or part is None:
+            return None  # not a VocabParallelEmbedding → full read (P3D)
+        try:
+            return (
+                int(si.org_vocab_start_index),
+                int(si.org_vocab_end_index),
+                int(part),
+            )
+        except AttributeError:
+            return None
 
     @staticmethod
     def _is_tp_rank0() -> bool:

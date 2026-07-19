@@ -417,6 +417,15 @@ class VocabParallelEmbedding(CustomOp):
     def weight_loader(self, param: Parameter, loaded_weight: torch.Tensor):
         output_dim = getattr(param, "output_dim", None)
         packed_dim = getattr(param, "packed_dim", None)
+        # wt_cxl P3A-4: when the CXL canonical-store reader has already read only this
+        # rank's vocab slice ([org_vocab_start_index, org_vocab_end_index)), it marks the
+        # param is_sharded_weight so this loader skips ONLY its own per-rank narrow (and
+        # the org_vocab_size assert on the un-narrowed tensor), while KEEPING the copy +
+        # padding zero-fill below. Generic + default-OFF: no vocab param carries the attr
+        # unless our reader set it, so normal loads are byte-for-byte unchanged. The
+        # reuse thesis (extend the loader's already-sharded-input hook rather than
+        # re-implement placement) — same as the v2 parameter.py loaders (iter-9 §7).
+        is_sharded_weight = getattr(param, "is_sharded_weight", False)
 
         # If the parameter is a gguf weight, then load it directly.
         if getattr(param, "is_gguf_weight_type", None):
@@ -453,11 +462,19 @@ class VocabParallelEmbedding(CustomOp):
             )
             start_idx = start_idx // packed_factor
             shard_size = shard_size // packed_factor
-        else:
+        elif not is_sharded_weight:
             assert loaded_weight.shape[output_dim] == self.org_vocab_size
 
         # Copy the data. Select chunk corresponding to current shard.
-        loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+        if not is_sharded_weight:
+            loaded_weight = loaded_weight.narrow(output_dim, start_idx, shard_size)
+        else:
+            # Reuse path: loaded_weight is already this rank's org-vocab slice. Fail loud
+            # if the pre-slice geometry is wrong (silent corruption → crash instead).
+            assert loaded_weight.shape[output_dim] == shard_size, (
+                f"is_sharded_weight vocab slice has {loaded_weight.shape[output_dim]} "
+                f"rows on dim {output_dim}, expected shard_size {shard_size}"
+            )
         param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
         param[loaded_weight.shape[0] :].data.fill_(0)
 
