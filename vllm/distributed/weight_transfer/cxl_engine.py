@@ -108,6 +108,11 @@ class CXLWeightTransferEngine(
         # P3A TP-local slice read (kill the over-read); see p3a_reuse_loader_decision.md.
         self._tp_slice = _on("WT_CXL_TP_SLICE", lambda v: v == "1", "ENABLE_TP_SLICE")
         self._plan: dict | None = None  # name -> (dim, start, size); built once on first receive
+        # P3E: batch the 339 per-tensor load_weights into ONE call over a lazy generator, so
+        # qwen2.load_weights builds `params_dict = dict(named_parameters())` once, not 339x
+        # (kills the O(N_tensors x N_modules) module-tree re-walk = 92% of the residual read
+        # dispatch, per the P3B F-split). Orthogonal to the slice. See p3e_batch_load_design.md.
+        self._batch_load = _on("WT_CXL_BATCH_LOAD", lambda v: v == "1", "ENABLE_BATCH_LOAD")
         # D4d attribution: split residual read cost F into GPU-copy vs Python-dispatch to
         # decide P3B vs batching the loads. Instrumented → attribution-only, never a verdict.
         self._read_prof = _on("WT_CXL_READ_CPROFILE", lambda v: v not in ("0", ""),
@@ -193,7 +198,8 @@ class CXLWeightTransferEngine(
             if self._read_prof:
                 self._prof_emit(
                     f"[WT-CXL-READ-OPEN] gpu_direct={self._cuda_direct} "
-                    f"tp_slice={self._tp_slice} read_prof={self._read_prof} "
+                    f"tp_slice={self._tp_slice} batch_load={self._batch_load} "
+                    f"read_prof={self._read_prof} "
                     f"owner_tensors={len(self._owner_names)} prof_dir={self._read_prof_dir}")
 
     def receive_weights(
@@ -260,83 +266,54 @@ class CXLWeightTransferEngine(
         _s_stage = _s_ldisp = _s_copygpu = 0.0  # split accumulators (s): H2D, load-dispatch, copy-gpu
 
         t0 = time.perf_counter()
-        for name in self._owner_names:
-            _ts = time.perf_counter() if _do_split else 0.0
-            entry = plan.get(name) if plan else None
-            if entry is not None:
-                # P3A reuse-path: read ONLY this rank's slice from the store. The
-                # loader skips its narrow (is_sharded_weight, set in _build_plan) but
-                # still does fused placement + quant repack — so we move full/TP bytes.
-                dim, start, size = entry
-                sl = self._store.region_view(slot, name).narrow(dim, start, size)
-                if c2:
-                    digest = xor_digest_update(digest, name, sl.contiguous())
-                if use_cuda and self._cuda_direct:
-                    # Fast path: the store region is host-REGISTERED (pinned), so DMA
-                    # straight from it. Guarded H2D: strided (row) slice ->
-                    # cudaMemcpy2DAsync (pitched DMA, 5-20x over torch's strided copy_);
-                    # contiguous (column/vocab/qkv) slice or dtype-mismatch -> copy_
-                    # (keeps auto-cast). See gpu_h2d.slice_h2d.
-                    tensor = torch.empty(tuple(sl.shape), dtype=sl.dtype, device="cuda")
-                    self._slice_h2d(sl, tensor)
-                elif use_cuda:
-                    # Store NOT host-registered (cudaHostRegister unavailable on this
-                    # node — gpu_direct=False). A DIRECT H2D from the non-pinned,
-                    # file-backed mmap region can fail (cudaErrorInvalidValue), so stage
-                    # the slice through a normal pinned CPU buffer first (copy_ gathers a
-                    # strided row slice on the CPU), then H2D — the same two-hop
-                    # robustness the full-read path uses below. Slower, but only on an
-                    # already-degraded no-GPU-direct node; the perf verdict runs pinned.
-                    staged = torch.empty(
-                        tuple(sl.shape), dtype=sl.dtype, device="cpu", pin_memory=True
+        if self._batch_load:
+            # P3E: ONE load_weights call over a lazy generator. qwen2.load_weights builds
+            # params_dict = dict(named_parameters()) ONCE (not per tensor), killing the
+            # O(N_tensors x N_modules) re-walk. The generator yields one tensor at a time and
+            # its local ref drops at each yield, so peak alive H2D memory stays one layer's
+            # worth (the layerwise loader frees each layer on completion) — same bound the
+            # per-tensor path kept, WITHOUT holding all 339 tensors. Split instrumentation is
+            # inherently per-tensor (skipped here); the coarse timing + cProfile still apply.
+            _stats = {"bytes": 0, "digest": 0}
+
+            def _weight_gen():
+                for name in self._owner_names:
+                    tensor, nbytes, dsrc = self._read_one(
+                        name, plan, slot, use_cuda, version, c2
                     )
-                    staged.copy_(sl)
-                    tensor = staged.to("cuda", non_blocking=True)
-                else:
-                    tensor = sl.contiguous()
-                total_bytes += sl.numel() * sl.element_size()
-            elif self._cuda_direct:
-                # One-hop DMA: registered (pinned) store region -> a fresh cuda
-                # tensor, no pinned-CPU stage. Same stream as load_weights below, so
-                # the non_blocking copy is ordered before the load reads it.
-                region = self._store.region_view(slot, name)
+                    _stats["bytes"] += nbytes
+                    if c2:
+                        _stats["digest"] = xor_digest_update(
+                            _stats["digest"], name, dsrc
+                        )
+                    yield (name, tensor)
+
+            load_weights(_weight_gen())
+            total_bytes = _stats["bytes"]
+            digest = _stats["digest"]
+        else:
+            # Incremental per-tensor load (default). Tensors arrive in manifest = checkpoint
+            # order, so each layer's set completes in order (layerwise-reload contract) and
+            # peak host/device memory stays bounded to one layer.
+            for name in self._owner_names:
+                _ts = time.perf_counter() if _do_split else 0.0
+                tensor, nbytes, dsrc = self._read_one(
+                    name, plan, slot, use_cuda, version, c2
+                )
                 if c2:
-                    digest = xor_digest_update(digest, name, region)
-                tensor = torch.empty(region.shape, dtype=region.dtype, device="cuda")
-                tensor.copy_(region, non_blocking=True)
-                total_bytes += region.nbytes
-            elif use_cuda:
-                # Two-hop fallback (iter-7): store -> reused pinned CPU buffer -> H2D.
-                buf = self._pinned.get(name)
-                if buf is None:
-                    spec = next(t for t in self._store.manifest.tensors if t.name == name)
-                    buf = torch.empty(spec.shape, dtype=spec.dtype, device="cpu", pin_memory=True)
-                    self._pinned[name] = buf
-                self._store.read_tensor_into(version, name, buf)
-                if c2:
-                    digest = xor_digest_update(digest, name, buf)
-                tensor = buf.to("cuda", non_blocking=True)
-                total_bytes += buf.nbytes
-            else:  # CPU-only (C1 / no CUDA): hand the store view straight to load
-                region = self._store.region_view(slot, name)
-                if c2:
-                    digest = xor_digest_update(digest, name, region)
-                tensor = region
-                total_bytes += region.nbytes
-            # Incremental load (one tensor) keeps peak host/device memory bounded
-            # and matches the layerwise-reload contract (tensors arrive in manifest
-            # = checkpoint order, so each layer's set completes in order).
-            if _do_split:
-                torch.cuda.synchronize()  # H2D (staging) GPU done
-                _t1 = time.perf_counter()
-            load_weights([(name, tensor)])
-            if _do_split:
-                _t2 = time.perf_counter()  # load DISPATCH done (Python; async copy_ launched, not yet run)
-                torch.cuda.synchronize()   # copy_ GPU execution done
-                _t3 = time.perf_counter()
-                _s_stage += _t1 - _ts      # H2D dispatch + GPU (≈ B, per-tensor)
-                _s_ldisp += _t2 - _t1      # load_weights Python dispatch (narrow skip + fused placement + copy_ launch)
-                _s_copygpu += _t3 - _t2    # param_data.copy_ GPU execution (the d2d placement copy)
+                    digest = xor_digest_update(digest, name, dsrc)
+                total_bytes += nbytes
+                if _do_split:
+                    torch.cuda.synchronize()  # H2D (staging) GPU done
+                    _t1 = time.perf_counter()
+                load_weights([(name, tensor)])
+                if _do_split:
+                    _t2 = time.perf_counter()  # load DISPATCH done (Python; async copy_ launched)
+                    torch.cuda.synchronize()   # copy_ GPU execution done
+                    _t3 = time.perf_counter()
+                    _s_stage += _t1 - _ts      # H2D dispatch + GPU (≈ B, per-tensor)
+                    _s_ldisp += _t2 - _t1      # load_weights Python dispatch
+                    _s_copygpu += _t3 - _t2    # param_data.copy_ GPU execution (d2d placement)
         if _instr:
             _t_pre = time.perf_counter()
         if use_cuda:
@@ -357,6 +334,7 @@ class CXLWeightTransferEngine(
             self._prof_emit(
                 f"[WT-CXL-READ-COARSE idx={_idx}] loop_dispatch_wall={_t_pre - t0:.3f}s "
                 f"final_sync_gpu_tail={_t_post - _t_pre:.3f}s total={_t_post - t0:.3f}s "
+                f"batch={'Y' if self._batch_load else 'N'} "
                 f"split={'Y' if _do_split else 'N'} cprof={'Y' if _do_cprof else 'N'}")
         if _do_cprof:
             _pr.disable()
@@ -382,12 +360,67 @@ class CXLWeightTransferEngine(
                 flush=True,
             )
         logger.info(
-            "CXL receive_weights v%d: %.2f GB from %d tensors in %.2fs",
+            "CXL receive_weights v%d: %.2f GB from %d tensors in %.2fs%s",
             version,
             total_bytes / 1e9,
             len(self._owner_names),
             time.perf_counter() - t0,
+            " [batched]" if self._batch_load else "",
         )
+
+    def _read_one(self, name, plan, slot, use_cuda, version, c2):
+        """Prepare one store tensor for ``load_weights``: the P3A slice, full one-hop
+        GPU-direct, two-hop pinned fallback, or CPU path — whichever applies. Returns
+        ``(tensor, nbytes, digest_src)`` where ``digest_src`` is the CPU-side bytes to fold
+        into the C2 digest (``None`` when ``c2`` is off, to skip the extra contiguous copy).
+
+        Shared verbatim by the per-tensor loop and the P3E batched generator so the read
+        semantics (bytes, H2D method, ordering) are one source of truth — batching changes
+        only how many times ``load_weights`` is entered, never what a tensor is read as."""
+        entry = plan.get(name) if plan else None
+        if entry is not None:
+            # P3A reuse-path: read ONLY this rank's slice. The loader skips its narrow
+            # (is_sharded_weight) but keeps fused placement + quant repack.
+            dim, start, size = entry
+            sl = self._store.region_view(slot, name).narrow(dim, start, size)
+            dsrc = sl.contiguous() if c2 else None
+            if use_cuda and self._cuda_direct:
+                # Registered (pinned) store region -> DMA straight in. Guarded H2D: strided
+                # (row) slice -> cudaMemcpy2DAsync (pitched, 5-20x over torch strided copy_);
+                # contiguous (column/vocab/qkv) or dtype-mismatch -> copy_. See slice_h2d.
+                tensor = torch.empty(tuple(sl.shape), dtype=sl.dtype, device="cuda")
+                self._slice_h2d(sl, tensor)
+            elif use_cuda:
+                # gpu_direct=False node: a direct H2D from the non-pinned file-backed mmap can
+                # fail, so stage through a pinned CPU buffer first, then H2D (two-hop).
+                staged = torch.empty(
+                    tuple(sl.shape), dtype=sl.dtype, device="cpu", pin_memory=True
+                )
+                staged.copy_(sl)
+                tensor = staged.to("cuda", non_blocking=True)
+            else:
+                tensor = sl.contiguous()
+            return tensor, sl.numel() * sl.element_size(), dsrc
+        if self._cuda_direct:
+            # One-hop DMA: registered store region -> fresh cuda tensor, same (default)
+            # stream as load_weights so the non_blocking copy is ordered before the load reads.
+            region = self._store.region_view(slot, name)
+            tensor = torch.empty(region.shape, dtype=region.dtype, device="cuda")
+            tensor.copy_(region, non_blocking=True)
+            return tensor, region.nbytes, (region if c2 else None)
+        if use_cuda:
+            # Two-hop fallback (iter-7): store -> reused pinned CPU buffer -> H2D.
+            buf = self._pinned.get(name)
+            if buf is None:
+                spec = next(t for t in self._store.manifest.tensors if t.name == name)
+                buf = torch.empty(spec.shape, dtype=spec.dtype, device="cpu", pin_memory=True)
+                self._pinned[name] = buf
+            self._store.read_tensor_into(version, name, buf)
+            tensor = buf.to("cuda", non_blocking=True)
+            return tensor, buf.nbytes, (buf if c2 else None)
+        # CPU-only (C1 / no CUDA): hand the store view straight to load.
+        region = self._store.region_view(slot, name)
+        return region, region.nbytes, (region if c2 else None)
 
     def _build_plan(self, model) -> None:
         """Classify each store owner tensor and build the per-rank slice plan.
