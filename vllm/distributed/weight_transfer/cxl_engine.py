@@ -77,11 +77,58 @@ class CXLWeightTransferEngine(
         self._cuda_direct = False  # True once the store is cudaHostRegister'd (P2 one-hop read)
         self._pinned: dict[str, torch.Tensor] = {}  # two-hop fallback buffers
         self._specs: dict = {}  # name -> TensorSpec (full shape) for P3A slice geometry
-        # P3A: read only this rank's ~1/TP slice (kill the over-read), reusing the
-        # vLLM loader via is_sharded_weight. Default OFF = the P2 full-read path.
-        # See claude_log/weight_sync/p3a_reuse_loader_decision.md.
-        self._tp_slice = os.environ.get("WT_CXL_TP_SLICE", "0") == "1"
+        # Attribution/toggle delivery — env OR a filesystem sentinel on shared /grand.
+        # This engine only runs when the cxl checkpoint engine is configured with
+        # reader=vllm_native (reader=vllm_checkpoint reads via veRL's own bucket generator
+        # and never enters this file — the cause of an earlier round of "no reader output").
+        # The sentinel is a delivery channel that does not depend on the ray-launched rollout
+        # worker inheriting the launcher's exported env: the profiling dir is derived from
+        # this module's own path (…/RL_post_training/vllm/vllm/distributed/weight_transfer/
+        # cxl_engine.py → 4 parents up = project root), and a sentinel file in that dir enables
+        # each toggle. Env still works and takes precedence. Default (no sentinel, no env) =
+        # OFF, so production behaviour is unchanged.
+        _proj = os.path.abspath(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         os.pardir, os.pardir, os.pardir, os.pardir)
+        )
+        self._read_prof_dir = (
+            os.environ.get("WT_CXL_READ_PROF_DIR")
+            or os.path.join(_proj, "wt_cxl_runs", "read_prof_dump")
+        )
+
+        def _on(env_key, env_true, sentinel):
+            env_val = os.environ.get(env_key, "0")
+            if env_true(env_val):
+                return True
+            try:
+                return os.path.exists(os.path.join(self._read_prof_dir, sentinel))
+            except OSError:
+                return False
+
+        # P3A TP-local slice read (kill the over-read); see p3a_reuse_loader_decision.md.
+        self._tp_slice = _on("WT_CXL_TP_SLICE", lambda v: v == "1", "ENABLE_TP_SLICE")
         self._plan: dict | None = None  # name -> (dim, start, size); built once on first receive
+        # D4d attribution: split residual read cost F into GPU-copy vs Python-dispatch to
+        # decide P3B vs batching the loads. Instrumented → attribution-only, never a verdict.
+        self._read_prof = _on("WT_CXL_READ_CPROFILE", lambda v: v not in ("0", ""),
+                              "ENABLE_READ_PROF")
+        self._recv_idx = 0  # receive_weights call counter (0 = warmup, excluded like WSPHASE)
+
+    def _prof_emit(self, line: str) -> None:
+        """Emit an attribution line to BOTH stdout (ray, if it forwards) and a file on
+        shared /grand (robust to ray's stdout-forwarding drop). Best-effort file write."""
+        print(line, flush=True)
+        d = self._read_prof_dir
+        if not d:
+            return
+        try:
+            import socket
+            os.makedirs(d, exist_ok=True)
+            path = os.path.join(d, f"readsplit_{socket.gethostname()}_pid{os.getpid()}.log")
+            with open(path, "a") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
 
     def init_transfer_engine(self, init_info: CXLWeightTransferInitInfo) -> None:
         if not init_info.store_uri:
@@ -140,6 +187,14 @@ class CXLWeightTransferEngine(
         if self._is_tp_rank0():
             print(f"[WT-CXL] reader gpu_direct={self._cuda_direct} "
                   f"({len(self._owner_names)} owner tensors)", flush=True)
+            # Unconditional "reader ran" marker to the prof dir (bypasses ray fwd): confirms
+            # cxl_engine.receive_weights actually executed on this rollout worker, and records
+            # whether the slice + profiling toggles resolved ON (via env or /grand sentinel).
+            if self._read_prof:
+                self._prof_emit(
+                    f"[WT-CXL-READ-OPEN] gpu_direct={self._cuda_direct} "
+                    f"tp_slice={self._tp_slice} read_prof={self._read_prof} "
+                    f"owner_tensors={len(self._owner_names)} prof_dir={self._read_prof_dir}")
 
     def receive_weights(
         self,
@@ -177,8 +232,36 @@ class CXLWeightTransferEngine(
         slot = self._store.active_slot
         if c2:
             from shared_weight_store.digest import xor_digest_update
+
+        # --- D4d attribution (WT_CXL_READ_CPROFILE; rank-0; quarantined, never a verdict) ---
+        # Split the residual read cost F into GPU-copy (the 339 param_data.copy_) vs
+        # Python-dispatch (per-tensor weight_loader/_layerwise_process under the GIL), to
+        # decide P3B (copy-stream overlap) vs batching the loads (see p3b_read_pipeline_design.md).
+        # Method A (steady calls 1,3): insert per-tensor cuda.synchronize() to time copy_gpu
+        # (F.gpu_copy) vs load_dispatch (F.dispatch) directly — immune to cProfile's blindness
+        # inside aten::copy_. Method B (steady call 2): cProfile the natural (pipelined) path to
+        # attribute the Python dispatch to specific frames (= the batching target if dispatch-bound).
+        _idx = self._recv_idx
+        self._recv_idx += 1
+        _instr = self._read_prof and use_cuda and self._is_tp_rank0()
+        _do_split = _instr and _idx in (1, 3)  # per-tensor sync: copy_gpu vs load_dispatch
+        _do_cprof = _instr and _idx == 2       # cProfile natural path: which Python frames
+        if _instr and _idx == 0:
+            self._prof_emit(
+                f"[WT-CXL-READ-ENV] WT_CXL_READ_CPROFILE={self._read_prof} "
+                f"gpu_direct={self._cuda_direct} tp_slice={self._tp_slice} "
+                f"owner_tensors={len(self._owner_names)} "
+                f"sliced={len(plan) if plan else 0}")
+        _pr = None
+        if _do_cprof:
+            import cProfile
+            _pr = cProfile.Profile()
+            _pr.enable()
+        _s_stage = _s_ldisp = _s_copygpu = 0.0  # split accumulators (s): H2D, load-dispatch, copy-gpu
+
         t0 = time.perf_counter()
         for name in self._owner_names:
+            _ts = time.perf_counter() if _do_split else 0.0
             entry = plan.get(name) if plan else None
             if entry is not None:
                 # P3A reuse-path: read ONLY this rank's slice from the store. The
@@ -243,9 +326,48 @@ class CXLWeightTransferEngine(
             # Incremental load (one tensor) keeps peak host/device memory bounded
             # and matches the layerwise-reload contract (tensors arrive in manifest
             # = checkpoint order, so each layer's set completes in order).
+            if _do_split:
+                torch.cuda.synchronize()  # H2D (staging) GPU done
+                _t1 = time.perf_counter()
             load_weights([(name, tensor)])
+            if _do_split:
+                _t2 = time.perf_counter()  # load DISPATCH done (Python; async copy_ launched, not yet run)
+                torch.cuda.synchronize()   # copy_ GPU execution done
+                _t3 = time.perf_counter()
+                _s_stage += _t1 - _ts      # H2D dispatch + GPU (≈ B, per-tensor)
+                _s_ldisp += _t2 - _t1      # load_weights Python dispatch (narrow skip + fused placement + copy_ launch)
+                _s_copygpu += _t3 - _t2    # param_data.copy_ GPU execution (the d2d placement copy)
+        if _instr:
+            _t_pre = time.perf_counter()
         if use_cuda:
             torch.cuda.synchronize()
+        if _instr:
+            _t_post = time.perf_counter()
+            if _do_split:
+                _F = _s_ldisp + _s_copygpu
+                self._prof_emit(
+                    f"[WT-CXL-READ-SPLIT idx={_idx}] owner={len(self._owner_names)} "
+                    f"sliced={len(plan) if plan else 0} | "
+                    f"F.gpu_copy(copy_)={_s_copygpu:.3f}s  F.dispatch(load)={_s_ldisp:.3f}s  "
+                    f"B.H2D(stage)={_s_stage:.3f}s | F={_F:.3f}s "
+                    f"gpu_copy_frac={(_s_copygpu / _F if _F else 0):.2f}")
+            # Coarse cross-check (esp. the cProfile/natural call, no per-tensor syncs):
+            # loop_dispatch_wall = Python racing through all launches; final_sync_gpu_tail =
+            # total GPU work still outstanding at loop end (= the writer's 92/8 method, D4d side).
+            self._prof_emit(
+                f"[WT-CXL-READ-COARSE idx={_idx}] loop_dispatch_wall={_t_pre - t0:.3f}s "
+                f"final_sync_gpu_tail={_t_post - _t_pre:.3f}s total={_t_post - t0:.3f}s "
+                f"split={'Y' if _do_split else 'N'} cprof={'Y' if _do_cprof else 'N'}")
+        if _do_cprof:
+            _pr.disable()
+            import io as _io
+            import pstats as _pstats
+            _b1 = _io.StringIO()
+            _pstats.Stats(_pr, stream=_b1).sort_stats("cumulative").print_stats(45)
+            self._prof_emit(f"[WT-CXL-READ-CPROFILE-CUMULATIVE idx={_idx}]\n{_b1.getvalue()}")
+            _b2 = _io.StringIO()
+            _pstats.Stats(_pr, stream=_b2).sort_stats("tottime").print_stats(35)
+            self._prof_emit(f"[WT-CXL-READ-CPROFILE-TOTTIME idx={_idx}]\n{_b2.getvalue()}")
         if c2 and self._is_tp_rank0():
             # Full-read path: digest == the trainer's send digest (over full_tensor())
             # proves the per-worker store read reconstructed the canonical weights
