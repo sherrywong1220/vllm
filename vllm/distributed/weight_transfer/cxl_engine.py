@@ -213,7 +213,16 @@ class CXLWeightTransferEngine(
         self._ensure_open()
 
         version = update_info.version
+        # P6 attribution (ALWAYS-ON, WSPHASE-class): D4d decomposes into exactly two
+        # parts — the reader blocked on the trainer's write+commit, and the read loop
+        # itself. Archived logs put the former at ~70% of D4d (and the veRL server
+        # adapter at ~0.00 s), but only by subtraction; this times it directly. Cost is
+        # two perf_counter reads + one rank-0 line per call = the same perturbation
+        # class as the D4b/D4d markers, so it stays valid on an un-instrumented verdict
+        # run. The wait is what P6 removes; see p6_offload_fused_write_design.md.
+        _t_wait = time.perf_counter()
         self._store.wait_committed(min_version=version, timeout_s=_WAIT_TIMEOUT_S)
+        _wait_s = time.perf_counter() - _t_wait
 
         # P3A: build the TP-slice copy plan once. load_weights is model.load_weights
         # (a bound method) on the checkpoint-format path, so __self__ is the live
@@ -341,8 +350,9 @@ class CXLWeightTransferEngine(
             _t_pre = time.perf_counter()
         if use_cuda:
             torch.cuda.synchronize()
+        _t_loop_end = time.perf_counter()
         if _instr:
-            _t_post = time.perf_counter()
+            _t_post = _t_loop_end
             if _do_split:
                 _F = _s_ldisp + _s_copygpu
                 self._prof_emit(
@@ -358,6 +368,11 @@ class CXLWeightTransferEngine(
                 f"[WT-CXL-READ-COARSE idx={_idx}] loop_dispatch_wall={_t_pre - t0:.3f}s "
                 f"final_sync_gpu_tail={_t_post - _t_pre:.3f}s total={_t_post - t0:.3f}s "
                 f"split={'Y' if _do_split else 'N'} cprof={'Y' if _do_cprof else 'N'}")
+        if self._is_tp_rank0():
+            # The always-on D4d split (see the note at wait_committed above).
+            self._prof_emit(
+                f"[WSPHASE-CXL-READ idx={_idx}] D4d_wait_committed={_wait_s:.3f}s "
+                f"D4d_read_loop={_t_loop_end - t0:.3f}s")
         if _do_cprof:
             _pr.disable()
             import io as _io
