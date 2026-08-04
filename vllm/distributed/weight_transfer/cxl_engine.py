@@ -370,9 +370,19 @@ class CXLWeightTransferEngine(
                 f"split={'Y' if _do_split else 'N'} cprof={'Y' if _do_cprof else 'N'}")
         if self._is_tp_rank0():
             # The always-on D4d split (see the note at wait_committed above).
+            # read_gb is here because it is the NODE-HEALTH CANARY: Sophia shows ~8x
+            # node-to-node PCIe variance, and A/Bs used to gate comparability on D4b
+            # (the trainer write). P6-M2 deletes the write, so a zero D4b now means
+            # "the mechanism worked", not "the node is fast" — the canary had to move
+            # to the read side. The read loop is H2D-bandwidth bound (P3B/P3E), so
+            # read_gb / read_loop is a direct PCIe reading, and it stays comparable
+            # across arms whose store dtype makes them move different bytes by design.
+            # One extra number in an existing rank-0 line = same perturbation class,
+            # so it remains valid on an un-instrumented verdict run.
             self._prof_emit(
                 f"[WSPHASE-CXL-READ idx={_idx}] D4d_wait_committed={_wait_s:.3f}s "
-                f"D4d_read_loop={_t_loop_end - t0:.3f}s")
+                f"D4d_read_loop={_t_loop_end - t0:.3f}s "
+                f"read_gb={total_bytes / 1e9:.3f}")
         if _do_cprof:
             _pr.disable()
             import io as _io
