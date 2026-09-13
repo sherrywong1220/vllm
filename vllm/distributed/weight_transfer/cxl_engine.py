@@ -47,6 +47,83 @@ _WAIT_TIMEOUT_S = 600.0
 
 
 @dataclass
+class _EPEntry:
+    """P7 plan entry for one fused 3D expert store tensor (``mlp.experts.gate_up_proj``
+    ``[E, 2I, H]`` / ``down_proj`` ``[E, H, I]``). Ownership is the engine's live
+    ``expert_map`` turned into contiguous read runs (``shared_weight_store.expert_plan``),
+    never recomputed from config (design §3.2)."""
+
+    kind: str  # "w13" | "w2"
+    runs: list  # [ExpertRun]: (global_start, local_start, count)
+    param: torch.nn.Parameter  # experts.w13_weight / w2_weight — this rank's [E_local, ...]
+    module: Any  # the FusedMoE layer (owns weight_loader + _expert_map)
+    param_name: str
+    n_local: int
+
+
+def ep_bridge_loader(entry: _EPEntry, run, block: torch.Tensor) -> int:
+    """Bridge A (reuse): feed one contiguous expert block (``[count, ...]``, GLOBAL ids
+    ``run.global_start + i``) through vLLM's own per-expert ``weight_loader``. The loader
+    re-derives the local slot from the engine's ``_expert_map``, so a disagreement
+    between our runs and the engine's ownership surfaces as ``False`` (raised here)
+    instead of a silent mis-place. Cost: 2 (w13) / 1 (w2) loader calls per expert, each
+    a d2d ``copy_`` plus an ``_expert_map[...].item()`` device sync — the §3.4
+    per-tensor overhead this phase must attribute, which is why bridge B exists.
+
+    ``weight_name`` handed to the loader is the PARAM name (``…experts.w13_weight``),
+    never the store name: the loader dispatches on substrings of that string
+    (``"weight" in weight_name`` selects the model-weight path; a name without it
+    returns False for every expert). C1 (test_ep_bridge) caught this."""
+    n = 0
+    name = entry.param_name
+    if entry.kind == "w13":
+        inter = block.shape[1] // 2
+        for i in range(run.count):
+            gid = run.global_start + i
+            ok1 = entry.module.weight_loader(
+                entry.param, block[i, :inter], name, shard_id="w1", expert_id=gid, return_success=True
+            )
+            ok3 = entry.module.weight_loader(
+                entry.param, block[i, inter:], name, shard_id="w3", expert_id=gid, return_success=True
+            )
+            if not (ok1 and ok3):
+                raise RuntimeError(
+                    f"P7 ep-slice: engine refused expert {gid} of {name} (gate={ok1}, up={ok3}) "
+                    "— read plan and engine expert_map disagree"
+                )
+            n += 1
+    else:
+        for i in range(run.count):
+            gid = run.global_start + i
+            ok = entry.module.weight_loader(
+                entry.param, block[i], name, shard_id="w2", expert_id=gid, return_success=True
+            )
+            if not ok:
+                raise RuntimeError(
+                    f"P7 ep-slice: engine refused expert {gid} of {name} — read plan and "
+                    "engine expert_map disagree"
+                )
+            n += 1
+    return n
+
+
+def ep_bridge_direct(entry: _EPEntry, run, block: torch.Tensor) -> int:
+    """Bridge B (direct): ONE d2d copy of the whole run into the param's local slots.
+    Valid for unquantized experts because the fused ``w13`` layout is ``[gate; up]`` on
+    dim 1 — the same order HF's ``Concatenate(dim=1)`` produces and ``_load_w13`` writes
+    (C1b: bitwise-equal to bridge A). Casts if the store dtype (fp32 under P6-M2)
+    differs from the param dtype."""
+    dst = entry.param.data.narrow(0, run.local_start, run.count)
+    if tuple(dst.shape) != tuple(block.shape):
+        raise RuntimeError(
+            f"P7 ep-slice direct: local slot shape {tuple(dst.shape)} != block "
+            f"{tuple(block.shape)} for {entry.param_name}"
+        )
+    dst.copy_(block)
+    return run.count
+
+
+@dataclass
 class CXLWeightTransferInitInfo(WeightTransferInitInfo):
     """One field: where the shared canonical store lives."""
 
@@ -108,6 +185,19 @@ class CXLWeightTransferEngine(
         # P3A TP-local slice read (kill the over-read); see p3a_reuse_loader_decision.md.
         self._tp_slice = _on("WT_CXL_TP_SLICE", lambda v: v == "1", "ENABLE_TP_SLICE")
         self._plan: dict | None = None  # name -> (dim, start, size); built once on first receive
+        # P7 EP-aware expert slice read: off (full read of the fused 3D experts; the
+        # loader filters to local experts — the P3D-style correctness baseline),
+        # loader (read only this rank's expert run(s), bridge A), direct (bridge B).
+        # See p7_ep_aware_slice_read_design.md §1.
+        self._ep_slice = os.environ.get("WT_CXL_EP_SLICE", "off").strip().lower() or "off"
+        if self._ep_slice not in ("off", "loader", "direct"):
+            raise ValueError(f"WT_CXL_EP_SLICE must be off|loader|direct, got {self._ep_slice!r}")
+        self._ep_plan: dict[str, _EPEntry] = {}
+        self._classes: dict[str, str] = {}  # owner name -> tp | expert | repl (§1.1 accounting)
+        self._class_bytes: dict[str, int] = {"tp": 0, "expert": 0, "repl": 0}
+        self._param_names: set[str] | None = None  # model params, for the coverage oracle
+        self._world: dict = {"tp": 1, "ep": 1, "dp": 1, "ep_rank": 0}
+        self._coaxial: str = "na"
         # D4d attribution: split residual read cost F into GPU-copy vs Python-dispatch to
         # decide P3B vs batching the loads. Instrumented → attribution-only, never a verdict.
         self._read_prof = _on("WT_CXL_READ_CPROFILE", lambda v: v not in ("0", ""),
@@ -227,9 +317,10 @@ class CXLWeightTransferEngine(
         # P3A: build the TP-slice copy plan once. load_weights is model.load_weights
         # (a bound method) on the checkpoint-format path, so __self__ is the live
         # vLLM model we introspect for shard geometry + set is_sharded_weight on.
-        if self._tp_slice and self._plan is None:
+        if self._plan is None:  # classification (accounting) runs even with every slice off
             self._build_plan(getattr(load_weights, "__self__", None))
         plan = self._plan
+        ep_plan = self._ep_plan
 
         use_cuda = torch.cuda.is_available()
         c2 = os.environ.get("WT_CXL_C2", "0") == "1"  # anti-cheat digest oracle
@@ -267,10 +358,58 @@ class CXLWeightTransferEngine(
             _pr = cProfile.Profile()
             _pr.enable()
         _s_stage = _s_ldisp = _s_copygpu = 0.0  # split accumulators (s): H2D, load-dispatch, copy-gpu
+        read_by_class = {"tp": 0, "expert": 0, "repl": 0}  # §1.1 three-way accounting
+        loaded: set[str] = set()  # absolute load-coverage oracle (§3.6.1)
+        ep_written: dict[str, int] = {}  # param_name -> local expert slots written this call
+        n_ep_runs = n_ep_calls = 0
 
         t0 = time.perf_counter()
         for name in self._owner_names:
             _ts = time.perf_counter() if _do_split else 0.0
+            cls = self._classes.get(name, "repl")
+            ep = ep_plan.get(name)
+            if ep is not None:
+                # P7: read ONLY this rank's expert run(s) of the fused [E, ...] canonical
+                # (contiguous dim-0 narrows -> plain copy_ DMA), then bridge them into the
+                # local [E_local, ...] param. No model.load_weights on this path: the
+                # fused name would be re-routed per expert anyway (shared-downstream fix),
+                # and the bridge is where bytes-vs-per-tensor cost is attributed.
+                for run in ep.runs:
+                    sl = self._store.region_view(slot, name).narrow(0, run.global_start, run.count)
+                    if c2:
+                        digest = xor_digest_update(digest, name, sl.contiguous())
+                    if use_cuda and self._cuda_direct:
+                        block = torch.empty(tuple(sl.shape), dtype=sl.dtype, device="cuda")
+                        self._slice_h2d(sl, block)
+                    elif use_cuda:
+                        staged = torch.empty(tuple(sl.shape), dtype=sl.dtype, device="cpu", pin_memory=True)
+                        staged.copy_(sl)
+                        block = staged.to("cuda", non_blocking=True)
+                    else:
+                        block = sl.contiguous()
+                    nb = sl.numel() * sl.element_size()
+                    total_bytes += nb
+                    read_by_class[cls] += nb
+                    n_ep_runs += 1
+                    if _do_split:
+                        torch.cuda.synchronize()
+                        _t1 = time.perf_counter()
+                    if self._ep_slice == "direct":
+                        n = ep_bridge_direct(ep, run, block)
+                        n_ep_calls += 1
+                    else:
+                        n = ep_bridge_loader(ep, run, block)
+                        n_ep_calls += n * (2 if ep.kind == "w13" else 1)
+                    ep_written[ep.param_name] = ep_written.get(ep.param_name, 0) + n
+                    if _do_split:
+                        _t2 = time.perf_counter()
+                        torch.cuda.synchronize()
+                        _t3 = time.perf_counter()
+                        _s_stage += _t1 - _ts
+                        _s_ldisp += _t2 - _t1
+                        _s_copygpu += _t3 - _t2
+                        _ts = _t3
+                continue
             entry = plan.get(name) if plan else None
             if entry is not None:
                 # P3A reuse-path: read ONLY this rank's slice from the store. The
@@ -304,6 +443,7 @@ class CXLWeightTransferEngine(
                 else:
                     tensor = sl.contiguous()
                 total_bytes += sl.numel() * sl.element_size()
+                read_by_class[cls] += sl.numel() * sl.element_size()
             elif self._cuda_direct:
                 # One-hop DMA: registered (pinned) store region -> a fresh cuda
                 # tensor, no pinned-CPU stage. Same stream as load_weights below, so
@@ -314,6 +454,7 @@ class CXLWeightTransferEngine(
                 tensor = torch.empty(region.shape, dtype=region.dtype, device="cuda")
                 tensor.copy_(region, non_blocking=True)
                 total_bytes += region.nbytes
+                read_by_class[cls] += region.nbytes
             elif use_cuda:
                 # Two-hop fallback (iter-7): store -> reused pinned CPU buffer -> H2D.
                 buf = self._pinned.get(name)
@@ -326,19 +467,23 @@ class CXLWeightTransferEngine(
                     digest = xor_digest_update(digest, name, buf)
                 tensor = buf.to("cuda", non_blocking=True)
                 total_bytes += buf.nbytes
+                read_by_class[cls] += buf.nbytes
             else:  # CPU-only (C1 / no CUDA): hand the store view straight to load
                 region = self._store.region_view(slot, name)
                 if c2:
                     digest = xor_digest_update(digest, name, region)
                 tensor = region
                 total_bytes += region.nbytes
+                read_by_class[cls] += region.nbytes
             # Incremental load (one tensor) keeps peak host/device memory bounded
             # and matches the layerwise-reload contract (tensors arrive in manifest
             # = checkpoint order, so each layer's set completes in order).
             if _do_split:
                 torch.cuda.synchronize()  # H2D (staging) GPU done
                 _t1 = time.perf_counter()
-            load_weights([(name, tensor)])
+            ret = load_weights([(name, tensor)])
+            if ret:
+                loaded.update(ret)  # model.load_weights returns the param names it touched
             if _do_split:
                 _t2 = time.perf_counter()  # load DISPATCH done (Python; async copy_ launched, not yet run)
                 torch.cuda.synchronize()   # copy_ GPU execution done
@@ -368,7 +513,46 @@ class CXLWeightTransferEngine(
                 f"[WT-CXL-READ-COARSE idx={_idx}] loop_dispatch_wall={_t_pre - t0:.3f}s "
                 f"final_sync_gpu_tail={_t_post - _t_pre:.3f}s total={_t_post - t0:.3f}s "
                 f"split={'Y' if _do_split else 'N'} cprof={'Y' if _do_cprof else 'N'}")
+        # --- absolute load-coverage oracle (§3.6.1; both slice toggles, every call) ---
+        # C2 is RELATIVE (cxl vs nccl through one shared loader), so a name silently
+        # dropped by the loader is invisible to it. This is the absolute check: every
+        # model parameter was written this call, either by model.load_weights (names it
+        # returns) or by the EP bridge (every local expert slot of every MoE param).
+        if self._param_names is not None:
+            covered = set(loaded)
+            for pn, n in ep_written.items():
+                ep_entry = next((e for e in ep_plan.values() if e.param_name == pn), None)
+                if ep_entry is not None and n == ep_entry.n_local:
+                    covered.add(pn)
+            missing = self._param_names - covered
+            if self._is_tp_rank0():
+                print(f"[WT-CXL-COVERAGE idx={_idx}] params={len(self._param_names)} "
+                      f"loaded={len(loaded)} ep_sliced={len(ep_written)} missing={len(missing)} "
+                      f"sample={sorted(missing)[:5]}", flush=True)
+            if missing and os.environ.get("WT_CXL_COVERAGE", "strict") != "warn":
+                raise RuntimeError(
+                    f"P7 coverage oracle: {len(missing)} model params not loaded this sync "
+                    f"(e.g. {sorted(missing)[:8]}) — a silently dropped name is weight "
+                    "corruption, not a warning (WT_CXL_COVERAGE=warn to downgrade)"
+                )
+
         if self._is_tp_rank0():
+            # §1.1 three-way accounting: per-class bytes read vs the theoretical floor
+            # (tp class / tp_size, expert class / ep_size, replicated class unchanged),
+            # plus the EP call counts that carry the §3.4 granularity story. Always-on,
+            # one rank-0 line = same perturbation class as the WSPHASE markers.
+            from shared_weight_store.expert_plan import lower_bounds
+            lb = lower_bounds(self._class_bytes, self._world["tp"], self._world["ep"])
+            self._prof_emit(
+                f"[WSPHASE-CXL-READ-ACCT idx={_idx}] tp_size={self._world['tp']} "
+                f"ep_size={self._world['ep']} dp_size={self._world['dp']} "
+                f"tp_slice={int(self._tp_slice)} ep_slice={self._ep_slice} "
+                f"tp_read_gb={read_by_class['tp'] / 1e9:.3f} tp_lb_gb={lb['tp'] / 1e9:.3f} "
+                f"expert_read_gb={read_by_class['expert'] / 1e9:.3f} expert_lb_gb={lb['expert'] / 1e9:.3f} "
+                f"repl_read_gb={read_by_class['repl'] / 1e9:.3f} repl_lb_gb={lb['repl'] / 1e9:.3f} "
+                f"expert_tensors={sum(1 for c in self._classes.values() if c == 'expert')} "
+                f"ep_sliced_tensors={len(ep_plan)} ep_runs={n_ep_runs} ep_bridge_calls={n_ep_calls} "
+                f"coaxial={self._coaxial}")
             # The always-on D4d split (see the note at wait_committed above).
             # read_gb is here because it is the NODE-HEALTH CANARY: Sophia shows ~8x
             # node-to-node PCIe variance, and A/Bs used to gate comparability on D4b
@@ -400,7 +584,7 @@ class CXLWeightTransferEngine(
             # comparable to send-over-full — labelled role=recv-sliced and excluded
             # from the equality oracle (its bitwise gate is C1b test_slice_plan; its
             # runtime oracle is generation-match). One print from TP rank 0.
-            role = "recv-sliced" if plan else "recv"
+            role = "recv-sliced" if (plan or ep_plan) else "recv"
             print(
                 f"[WT-CXL-C2] role={role} version={version} "
                 f"count={len(self._owner_names)} digest={digest:08x}",
@@ -415,29 +599,26 @@ class CXLWeightTransferEngine(
         )
 
     def _build_plan(self, model) -> None:
-        """Classify each store owner tensor and build the per-rank slice plan.
+        """Classify every store owner tensor (§1.1 accounting) and build the per-rank
+        slice plans: the P3A TP plan (``self._plan``) and the P7 EP plan
+        (``self._ep_plan``). Classification always runs; slicing is applied only when
+        the corresponding toggle is on, so an OFF arm reports the same class bytes.
 
-        Two classes are sliced (each ``is_sharded_weight``-marked so the loader skips
-        only its per-rank narrow but keeps fused placement + quant repack — C1b-verified):
+        Classes / plans:
 
-        * **P3A-1 pure row-parallel** (``o_proj``/``down_proj``): a direct model param,
-          sharded on ``input_dim``, classified by shape delta → strided dim-1 slice.
-        * **P3A-2 merged-column** (``gate_up_proj``): the store owner is the *unfused*
-          constituent (``gate_proj``/``up_proj``), NOT a model param, so it is mapped to
-          the fused param via ``packed_modules_mapping`` → contiguous dim-0 column slice.
-        * **P3A-3 fused-QKV** (``qkv_proj``): unfused ``q_proj``/``k_proj``/``v_proj``
-          mapped to the fused param + its ``QKVParallelLinear`` module → contiguous dim-0
-          slice with the **GQA ``num_kv_head_replicas``** rule for k/v (read off the module).
-        * **P3A-4 vocab-parallel** (``embed_tokens``/``lm_head``): a direct
-          ``VocabParallelEmbedding`` param → contiguous dim-0 slice on the **padded** vocab
-          dim, using ``[org_vocab_start_index, org_vocab_end_index)`` read off the module's
-          ``shard_indices`` (NOT an even shard — vocab padding; the extended loader keeps
-          the partition zero-fill). C1b-verified incl. a padded / zero-org-row rank.
-
-        Everything else — quantized/packed, or any param we cannot classify — gets NO plan
-        entry and rides the unchanged P2 full read (P3D coverage). So the reader never
-        silently mis-slices.
+        * **expert (P7)** — fused 3D routed-expert params (``mlp.experts.gate_up_proj``
+          ``[E, 2I, H]`` / ``down_proj`` ``[E, H, I]``) whose FusedMoE module is found
+          on the model. With EP on and ``WT_CXL_EP_SLICE != off``, ownership comes from
+          the module's live ``_expert_map`` (never recomputed from config — §3.2) as
+          contiguous runs; refused (full read, loader filters) on: no EP, EPLB on,
+          quantized param, per-expert shape mismatch, or a map the runs cannot cover.
+        * **tp (P3A)** — P3A-1 row / P3A-2 merged-column / P3A-3 fused-QKV /
+          P3A-4 vocab (each ``is_sharded_weight``-marked so the loader skips only its
+          per-rank narrow; C1b-verified) — unchanged from P3A.
+        * **repl** — everything else (norms, biases, router gate, quantized/packed,
+          unclassifiable): full read, never silently mis-sliced (P3D coverage).
         """
+        from shared_weight_store.expert_plan import coaxial, expert_runs
         from shared_weight_store.slice_plan import (
             column_slice_plan,
             qkv_slice_plan,
@@ -445,9 +626,10 @@ class CXLWeightTransferEngine(
             vocab_slice_plan,
         )
 
+        self._plan = {}
+        self._ep_plan = {}
         if model is None:
-            # Non-checkpoint-format caller (no bound model) — never slice.
-            self._plan = {}
+            # Non-checkpoint-format caller (no bound model) — never slice, no oracle.
             return
         try:
             from vllm.distributed import (
@@ -459,104 +641,208 @@ class CXLWeightTransferEngine(
             tp_size = get_tensor_model_parallel_world_size()
         except Exception:
             tp_rank, tp_size = 0, 1
+        self._world["tp"] = tp_size
 
         params = dict(model.named_parameters())
-        # P3A-3 needs the QKVParallelLinear module (GQA geometry lives on the module,
-        # not the param); built once, plan is cached after.
+        self._param_names = set(params)
+        self._model_for_mapping = model  # packed_modules_mapping lookups (P3A-2/3)
         modules = dict(model.named_modules())
         plan: dict = {}
         n_row = n_col = n_qkv = n_vocab = 0
+        n_expert = 0
+        ep_refused: dict[str, int] = {}
+        ep_info = None
+        trainer_world = os.environ.get("WT_CXL_TRAINER_WORLD")
+
+        def _nbytes(spec) -> int:
+            n = 1
+            for d in spec.shape:
+                n *= int(d)
+            return n * torch.empty((), dtype=spec.dtype).element_size()
+
         for name in self._owner_names:
-            if tp_size <= 1:
-                continue  # TP=1: no over-read, nothing to slice
             spec = self._specs.get(name)
             if spec is None:
+                self._classes[name] = "repl"
+                continue
+            nb = _nbytes(spec)
+
+            # --- P7: fused 3D expert params -----------------------------------------
+            ep = self._ep_target(name, spec, params, modules)
+            if ep is not None:
+                kind, module, param, pname = ep
+                self._classes[name] = "expert"
+                self._class_bytes["expert"] += nb
+                n_expert += 1
+                if ep_info is None:
+                    ep_info = module  # world facts come from the FIRST MoE layer
+                    self._world["ep"] = int(getattr(module, "ep_size", 1) or 1)
+                    self._world["dp"] = int(getattr(module, "dp_size", 1) or 1)
+                    self._world["ep_rank"] = int(getattr(module, "ep_rank", 0) or 0)
+                if self._ep_slice == "off":
+                    continue
+                reason = None
+                emap = getattr(module, "_expert_map", None)
+                if not getattr(module, "use_ep", False) or emap is None:
+                    reason = "no-ep"
+                elif getattr(module, "enable_eplb", False):
+                    reason = "eplb"  # plan would change at runtime (§3.8) — not this phase
+                elif not self._sliceable(param):
+                    reason = "quantized"
+                elif tuple(param.shape[1:]) != tuple(spec.shape[1:]):
+                    reason = "per-expert-shape"  # TP inside EP (moe_tensor_parallel) — loader narrows
+                else:
+                    try:
+                        runs = expert_runs(emap.tolist())
+                    except ValueError:
+                        runs, reason = [], "bad-expert-map"
+                    if reason is None:
+                        n_local = sum(r.count for r in runs)
+                        if n_local != int(getattr(module, "local_num_experts", -1)):
+                            reason = "local-count-mismatch"
+                        elif tuple(param.shape) != (n_local,) + tuple(spec.shape[1:]):
+                            reason = "local-param-shape"
+                if reason is not None:
+                    ep_refused[reason] = ep_refused.get(reason, 0) + 1
+                    continue
+                self._ep_plan[name] = _EPEntry(kind, runs, param, module, pname, n_local)
+                if self._coaxial == "na" and trainer_world:
+                    self._coaxial = "yes" if coaxial(
+                        emap.tolist(), self._world["ep_rank"], int(trainer_world)) else "no"
                 continue
 
-            p = params.get(name)
-            if p is not None:
-                # P3A-4: vocab-parallel (embed_tokens/lm_head) — a direct model param
-                # sharded on the padded vocab dim by VocabParallelEmbedding. Intercepted
-                # BEFORE the row branch: the slice is [org_vocab_start_index,
-                # org_vocab_end_index) read off the live module's shard_indices, NOT an
-                # even shard (vocab padding; see p3a4_vocab_slice_design.md §3.2). The
-                # loader (extended to honour is_sharded_weight) keeps the padding
-                # zero-fill; is_sharded_weight only skips its per-rank narrow.
-                if self._sliceable(p):
-                    vgeom = self._vocab_target(name, p, modules)
-                    if vgeom is not None:
-                        ventry = vocab_slice_plan(*vgeom)
-                        if ventry is not None:
-                            plan[name] = ventry
-                            setattr(p, "is_sharded_weight", True)
-                            n_vocab += 1
-                            continue
-                # P3A-1: direct model param → pure row-parallel (o_proj/down_proj),
-                # classified by shape delta. Must be a parallel linear weight the
-                # loader narrows + honours is_sharded_weight on (input_dim present on
-                # every ModelWeightParameter); column/replicated → None → full.
-                if not self._sliceable(p) or getattr(p, "input_dim", None) is None:
-                    continue
-                entry = row_slice_plan(
-                    tuple(spec.shape), tuple(p.shape), tp_rank, tp_size
-                )
-                if entry is None:
-                    continue  # not an evenly-sharded 2D row weight → full read
-                plan[name] = entry
-                setattr(p, "is_sharded_weight", True)  # loader skips its narrow
-                n_row += 1
+            # --- P3A: TP classes -------------------------------------------------------
+            tp = self._tp_target(name, spec, params, modules, tp_rank, tp_size,
+                                 row_slice_plan, column_slice_plan, qkv_slice_plan,
+                                 vocab_slice_plan)
+            if tp is None:
+                self._classes[name] = "repl"
+                self._class_bytes["repl"] += nb
                 continue
-
-            # P3A-2: fused checkpoint name — the store owner is an UNFUSED constituent
-            # (gate_proj/up_proj), not a model param. Map it to the fused merged-column
-            # param (gate_up_proj) via packed_modules_mapping and take its CONTIGUOUS
-            # dim-0 column slice. The loader still does fused PLACEMENT; is_sharded_weight
-            # only skips its per-rank narrow (v2 load_merged_column_weight; C1b-verified).
-            fused = self._merged_column_target(model, name, params)
-            if fused is not None:
-                if not self._sliceable(fused) or getattr(fused, "output_dim", None) is None:
-                    continue
-                entry = column_slice_plan(tuple(spec.shape), tp_rank, tp_size)
-                if entry is None:
-                    continue
-                plan[name] = entry
-                setattr(fused, "is_sharded_weight", True)  # on the fused param (idempotent)
-                n_col += 1
-                continue
-
-            # P3A-3: fused-QKV — store owner is unfused q/k/v; map to the fused qkv_proj
-            # param AND its QKVParallelLinear module (the GQA num_kv_head_replicas geometry
-            # is on the module, not the param). Contiguous dim-0 slice with the GQA replica
-            # rule (v2 load_qkv_weight keeps fused placement; C1b-verified incl. replicas=2).
-            qkv = self._qkv_target(model, name, params, modules)
-            if qkv is None:
-                continue
-            fused_p, shard_id, qkv_mod = qkv
-            if not self._sliceable(fused_p) or getattr(fused_p, "output_dim", None) is None:
-                continue
-            if not hasattr(qkv_mod, "num_kv_head_replicas"):
-                continue  # not a QKVParallelLinear-like module → full read (P3D)
-            entry = qkv_slice_plan(
-                shard_id, tp_rank, tp_size,
-                qkv_mod.num_heads, qkv_mod.num_kv_heads, qkv_mod.head_size,
-                getattr(qkv_mod, "v_head_size", qkv_mod.head_size),
-                qkv_mod.num_kv_head_replicas,
-            )
-            if entry is None:
+            entry, mark, kind = tp
+            self._classes[name] = "tp"
+            self._class_bytes["tp"] += nb
+            if not self._tp_slice:
                 continue
             plan[name] = entry
-            setattr(fused_p, "is_sharded_weight", True)  # on the fused param (idempotent)
-            n_qkv += 1
+            setattr(mark, "is_sharded_weight", True)  # loader skips its narrow (idempotent)
+            if kind == "row":
+                n_row += 1
+            elif kind == "col":
+                n_col += 1
+            elif kind == "qkv":
+                n_qkv += 1
+            else:
+                n_vocab += 1
 
         self._plan = plan
-        if self._is_tp_rank0():
-            print(
-                f"[WT-CXL] P3A tp-slice plan: {len(plan)}/{len(self._owner_names)} "
-                f"tensors sliced ({n_row} row-parallel + {n_col} merged-column + "
-                f"{n_qkv} qkv + {n_vocab} vocab), rest full-read "
-                f"(rank {tp_rank}/{tp_size})",
-                flush=True,
-            )
+        if self._is_tp_rank0() or self._ep_plan:
+            # Rank-0 prints the TP plan; EVERY rank prints its EP plan line, because
+            # co-axiality (§3.7) is per-rank (60 experts / 8 ranks: ranks 0-3 coincide,
+            # 4-7 do not) and only the rank itself knows its expert_map.
+            if self._is_tp_rank0():
+                print(
+                    f"[WT-CXL] P3A tp-slice plan: {len(plan)}/{len(self._owner_names)} "
+                    f"tensors sliced ({n_row} row-parallel + {n_col} merged-column + "
+                    f"{n_qkv} qkv + {n_vocab} vocab), rest full-read "
+                    f"(rank {tp_rank}/{tp_size}); classes: "
+                    f"tp={sum(1 for c in self._classes.values() if c == 'tp')} "
+                    f"expert={n_expert} repl={sum(1 for c in self._classes.values() if c == 'repl')}",
+                    flush=True,
+                )
+            if n_expert:
+                runs0 = next(iter(self._ep_plan.values())).runs if self._ep_plan else []
+                print(
+                    f"[WT-CXL] P7 ep-slice plan (mode={self._ep_slice}) rank tp{tp_rank} "
+                    f"ep{self._world['ep_rank']}/{self._world['ep']} dp={self._world['dp']}: "
+                    f"{len(self._ep_plan)}/{n_expert} expert tensors sliced, refused={ep_refused or '-'}, "
+                    f"local_experts={next(iter(self._ep_plan.values())).n_local if self._ep_plan else '-'} "
+                    f"runs={[(r.global_start, r.local_start, r.count) for r in runs0]} "
+                    f"coaxial(trainer_world={trainer_world})={self._coaxial}",
+                    flush=True,
+                )
+
+    @staticmethod
+    def _ep_target(name, spec, params, modules):
+        """If store owner ``name`` is a fused 3D routed-expert param of a FusedMoE
+        layer on this model, return ``(kind, module, param, param_name)`` with
+        ``kind`` ∈ {``w13``, ``w2``}; else ``None``. Duck-typed on the module having a
+        ``weight_loader`` and an ``_expert_map`` attribute (FusedMoE); no
+        ``isinstance`` coupling."""
+        if len(spec.shape) != 3:
+            return None
+        if name.endswith(".mlp.experts.gate_up_proj"):
+            kind, pfx = "w13", "w13_weight"
+        elif name.endswith(".mlp.experts.down_proj"):
+            kind, pfx = "w2", "w2_weight"
+        else:
+            return None
+        mod_name = name.rsplit(".", 1)[0]
+        module = modules.get(mod_name)
+        if module is None or not hasattr(module, "weight_loader") or not hasattr(module, "_expert_map"):
+            return None
+        pname = f"{mod_name}.{pfx}"
+        param = params.get(pname)
+        if param is None:
+            return None
+        return kind, module, param, pname
+
+    def _tp_target(self, name, spec, params, modules, tp_rank, tp_size,
+                   row_slice_plan, column_slice_plan, qkv_slice_plan, vocab_slice_plan):
+        """P3A classification, unchanged in logic from iter 9-12: return
+        ``(plan_entry, param_to_mark, kind)`` for a TP-sliceable owner, else ``None``.
+        ``kind`` ∈ {row, col, qkv, vocab}. Pure classification — the caller decides
+        whether to apply it (``is_sharded_weight`` is set only when TP slicing is on)."""
+        if tp_size <= 1:
+            return None  # TP=1: no over-read, nothing to slice
+        p = params.get(name)
+        if p is not None:
+            # P3A-4: vocab-parallel (embed_tokens/lm_head) — intercepted BEFORE the row
+            # branch; slice = [org_vocab_start_index, org_vocab_end_index) off the live
+            # module's shard_indices, NOT an even shard (p3a4 §3.2).
+            if self._sliceable(p):
+                vgeom = self._vocab_target(name, p, modules)
+                if vgeom is not None:
+                    ventry = vocab_slice_plan(*vgeom)
+                    if ventry is not None:
+                        return ventry, p, "vocab"
+            # P3A-1: direct model param → pure row-parallel (o_proj/down_proj) by shape
+            # delta; must be a parallel linear weight the loader narrows (input_dim).
+            if not self._sliceable(p) or getattr(p, "input_dim", None) is None:
+                return None
+            entry = row_slice_plan(tuple(spec.shape), tuple(p.shape), tp_rank, tp_size)
+            if entry is None:
+                return None  # not an evenly-sharded 2D row weight → full read
+            return entry, p, "row"
+
+        # P3A-2: unfused merged-column constituent (gate_proj/up_proj) → fused gate_up_proj.
+        fused = self._merged_column_target(self._model_for_mapping, name, params)
+        if fused is not None:
+            if not self._sliceable(fused) or getattr(fused, "output_dim", None) is None:
+                return None
+            entry = column_slice_plan(tuple(spec.shape), tp_rank, tp_size)
+            if entry is None:
+                return None
+            return entry, fused, "col"
+
+        # P3A-3: unfused q/k/v → fused qkv_proj + its QKVParallelLinear module (GQA rule).
+        qkv = self._qkv_target(self._model_for_mapping, name, params, modules)
+        if qkv is None:
+            return None
+        fused_p, shard_id, qkv_mod = qkv
+        if not self._sliceable(fused_p) or getattr(fused_p, "output_dim", None) is None:
+            return None
+        if not hasattr(qkv_mod, "num_kv_head_replicas"):
+            return None  # not a QKVParallelLinear-like module → full read (P3D)
+        entry = qkv_slice_plan(
+            shard_id, tp_rank, tp_size,
+            qkv_mod.num_heads, qkv_mod.num_kv_heads, qkv_mod.head_size,
+            getattr(qkv_mod, "v_head_size", qkv_mod.head_size),
+            qkv_mod.num_kv_head_replicas,
+        )
+        if entry is None:
+            return None
+        return entry, fused_p, "qkv"
 
     @staticmethod
     def _sliceable(p) -> bool:

@@ -1291,6 +1291,70 @@ class FusedMoE(CustomOp):
 
         return False if return_success else None
 
+    def load_fused_3d_weight(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        kind: str,
+        expert_id_offset: int = 0,
+    ) -> int:
+        """Load a FUSED 3D expert tensor through the per-expert ``weight_loader``.
+
+        wt_cxl P7 (shared downstream, used by BOTH the NCCL and the canonical-store
+        sync paths). HF transformers >= 5 keeps routed experts as fused 3D params —
+        ``mlp.experts.gate_up_proj`` ``[E, 2*I, H]`` (``Concatenate(dim=1)`` of gate
+        then up: ``conversion_mapping.py`` ``qwen2_moe`` entry) and
+        ``mlp.experts.down_proj`` ``[E, H, I]`` — and a trainer's ``state_dict()`` hands
+        out exactly those. The native model loaders only match per-expert names
+        (``experts.{id}.gate_proj.weight`` …), so a fused name falls through to
+        ``if name not in params_dict: continue`` and is dropped SILENTLY: the rollout
+        keeps its init-time experts (~95 % of a MoE's parameters) and nothing fails.
+
+        ``kind='w13'``: ``loaded_weight`` is ``[E, 2*I, H]``; row ``i`` is split into
+        ``w1 = [:I]`` / ``w3 = [I:]`` — the same [gate; up] order ``_load_w13`` writes.
+        ``kind='w2'``: ``loaded_weight`` is ``[E, H, I]``.
+        Expert ``i`` carries GLOBAL id ``expert_id_offset + i``; ``weight_loader`` maps it
+        to this rank's local slot (or skips it under expert parallelism), and still does
+        the TP narrow / quant handling the per-expert path does.
+
+        Deliberately NOT the ``weight_loader`` ``full_load`` (3D ``loaded_weight``)
+        branch: that path treats the loaded tensor as ALREADY this rank's ``[E_local,
+        …]`` and copies ``[:E_local]`` — under EP that silently loads experts
+        ``0..E_local-1`` on every rank. Returns the number of experts loaded here.
+        """
+        if kind not in ("w13", "w2"):
+            raise ValueError(f"kind must be 'w13' or 'w2', got {kind!r}")
+        if loaded_weight.dim() != 3:
+            raise ValueError(
+                f"{weight_name}: fused expert weight must be 3D, got {tuple(loaded_weight.shape)}"
+            )
+        n_loaded = 0
+        if kind == "w13":
+            inter = loaded_weight.shape[1] // 2
+            for i in range(loaded_weight.shape[0]):
+                gid = expert_id_offset + i
+                w = loaded_weight[i]
+                ok1 = self.weight_loader(
+                    param, w[:inter], weight_name, shard_id="w1", expert_id=gid, return_success=True
+                )
+                ok3 = self.weight_loader(
+                    param, w[inter:], weight_name, shard_id="w3", expert_id=gid, return_success=True
+                )
+                if ok1 != ok3:
+                    raise RuntimeError(
+                        f"{weight_name}: expert {gid} loaded gate={ok1} up={ok3} — torn fused load"
+                    )
+                n_loaded += int(ok1)
+        else:
+            for i in range(loaded_weight.shape[0]):
+                gid = expert_id_offset + i
+                ok = self.weight_loader(
+                    param, loaded_weight[i], weight_name, shard_id="w2", expert_id=gid, return_success=True
+                )
+                n_loaded += int(ok)
+        return n_loaded
+
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[str]:

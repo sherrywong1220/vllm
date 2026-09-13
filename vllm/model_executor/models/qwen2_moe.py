@@ -444,6 +444,31 @@ class Qwen2MoeModel(nn.Module):
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
         for name, loaded_weight in weights:
+            # wt_cxl P7 — fused 3D expert params (HF transformers >= 5 layout:
+            # `mlp.experts.gate_up_proj` [E, 2I, H] / `mlp.experts.down_proj` [E, H, I],
+            # what a trainer's state_dict() ships). The per-expert mapping below only
+            # matches `experts.{id}.gate_proj.weight`-style names, so these would be
+            # dropped SILENTLY (`name not in params_dict` -> continue) and the rollout
+            # would keep its init-time experts. Route them through the same per-expert
+            # weight_loader contract (FusedMoE.load_fused_3d_weight).
+            if loaded_weight.dim() == 3 and name.endswith(
+                (".mlp.experts.gate_up_proj", ".mlp.experts.down_proj")
+            ):
+                kind = "w13" if name.endswith(".gate_up_proj") else "w2"
+                experts_name = name.rsplit(".", 1)[0]
+                param_name = f"{experts_name}.{'w13_weight' if kind == 'w13' else 'w2_weight'}"
+                if is_pp_missing_parameter(param_name, self):
+                    continue
+                if param_name not in params_dict:
+                    raise KeyError(
+                        f"fused expert weight {name!r} has no target param {param_name!r}"
+                    )
+                experts = self.get_submodule(experts_name)
+                experts.load_fused_3d_weight(
+                    params_dict[param_name], loaded_weight, param_name, kind
+                )
+                loaded_params.add(param_name)
+                continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 # Skip non-stacked layers and experts (experts handled below).
                 if weight_name not in name:
