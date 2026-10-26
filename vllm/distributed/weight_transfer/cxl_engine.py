@@ -259,6 +259,10 @@ class CXLWeightTransferEngine(
         # read side. Best-effort: if registration fails (e.g. the gpudirect WRITER
         # already pinned the same shared /tmp pages, or a readonly mapping slipped
         # through), fall back to the staged two-hop read — never crash the sync.
+        # EXCEPT on the CXL pool (P4): there the fallbacks read shared payload through
+        # this host's cache (the slice/EP two-hop with a plain copy_, no invalidate),
+        # i.e. possibly another version's bytes, and it would be a different experiment
+        # anyway — so a pool reader is GPU-direct or it does not start.
         if torch.cuda.is_available():
             try:
                 ok = self._store.register_host_for_cuda()
@@ -271,12 +275,20 @@ class CXLWeightTransferEngine(
                 )
                 self._cuda_direct = bool(probe_pinned)
             except RuntimeError as e:
+                if self._store.is_pool:
+                    raise
                 print(f"[WT-CXL] GPU-direct read unavailable ({e}) — staged two-hop",
                       flush=True)
                 self._cuda_direct = False
+            if self._store.is_pool and not self._cuda_direct:
+                raise RuntimeError(
+                    "P4: a reader of the CXL pool store must be GPU-direct (store "
+                    "cudaHostRegister'd and detected pinned); refusing the two-hop "
+                    "fallback — run python -m shared_weight_store.cxl_probe")
         if self._is_tp_rank0():
             print(f"[WT-CXL] reader gpu_direct={self._cuda_direct} "
-                  f"({len(self._owner_names)} owner tensors)", flush=True)
+                  f"({len(self._owner_names)} owner tensors) pool={int(self._store.is_pool)} "
+                  f"run_id={self._store.run_id:x}", flush=True)
             # Unconditional "reader ran" marker to the prof dir (bypasses ray fwd): confirms
             # cxl_engine.receive_weights actually executed on this rollout worker, and records
             # whether the slice + profiling toggles resolved ON (via env or /grand sentinel).
@@ -330,8 +342,19 @@ class CXLWeightTransferEngine(
         # wait_committed (flips only at the next commit, which the stop-the-world
         # sync defers). region_view is a zero-copy CPU view into the store mmap.
         slot = self._store.active_slot
+        # P4 rule 3 (no-op off the pool): a CPU read of shared payload invalidates this
+        # host's cache before it, and after it — a later GPU DMA read on this host
+        # snoops the cache and would be served these lines once they are stale.
+        flush = self._store.flush
+        pool_cpu = self._store.is_pool and not use_cuda  # C1: the CPU loads the views
         if c2:
             from shared_weight_store.digest import xor_digest_update
+
+            def _digest(d, name, view):
+                flush(view)
+                d = xor_digest_update(d, name, view.contiguous())
+                flush(view)
+                return d
 
         # --- D4d attribution (WT_CXL_READ_CPROFILE; rank-0; quarantined, never a verdict) ---
         # Split the residual read cost F into GPU-copy (the 339 param_data.copy_) vs
@@ -368,6 +391,8 @@ class CXLWeightTransferEngine(
             _ts = time.perf_counter() if _do_split else 0.0
             cls = self._classes.get(name, "repl")
             ep = ep_plan.get(name)
+            if pool_cpu:
+                flush(self._store.region_view(slot, name))
             if ep is not None:
                 # P7: read ONLY this rank's expert run(s) of the fused [E, ...] canonical
                 # (contiguous dim-0 narrows -> plain copy_ DMA), then bridge them into the
@@ -377,7 +402,7 @@ class CXLWeightTransferEngine(
                 for run in ep.runs:
                     sl = self._store.region_view(slot, name).narrow(0, run.global_start, run.count)
                     if c2:
-                        digest = xor_digest_update(digest, name, sl.contiguous())
+                        digest = _digest(digest, name, sl)
                     if use_cuda and self._cuda_direct:
                         block = torch.empty(tuple(sl.shape), dtype=sl.dtype, device="cuda")
                         self._slice_h2d(sl, block)
@@ -418,7 +443,7 @@ class CXLWeightTransferEngine(
                 dim, start, size = entry
                 sl = self._store.region_view(slot, name).narrow(dim, start, size)
                 if c2:
-                    digest = xor_digest_update(digest, name, sl.contiguous())
+                    digest = _digest(digest, name, sl)
                 if use_cuda and self._cuda_direct:
                     # Fast path: the store region is host-REGISTERED (pinned), so DMA
                     # straight from it. Guarded H2D: strided (row) slice ->
@@ -450,7 +475,7 @@ class CXLWeightTransferEngine(
                 # the non_blocking copy is ordered before the load reads it.
                 region = self._store.region_view(slot, name)
                 if c2:
-                    digest = xor_digest_update(digest, name, region)
+                    digest = _digest(digest, name, region)
                 tensor = torch.empty(region.shape, dtype=region.dtype, device="cuda")
                 tensor.copy_(region, non_blocking=True)
                 total_bytes += region.nbytes
@@ -471,7 +496,7 @@ class CXLWeightTransferEngine(
             else:  # CPU-only (C1 / no CUDA): hand the store view straight to load
                 region = self._store.region_view(slot, name)
                 if c2:
-                    digest = xor_digest_update(digest, name, region)
+                    digest = _digest(digest, name, region)
                 tensor = region
                 total_bytes += region.nbytes
                 read_by_class[cls] += region.nbytes
