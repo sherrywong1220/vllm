@@ -9,7 +9,7 @@ from vllm.config.utils import config
 class WeightTransferConfig:
     """Configuration for weight transfer during RL training."""
 
-    backend: Literal["nccl", "ipc", "cxl"] = "nccl"
+    backend: Literal["nccl", "ipc", "cxl", "nccl_sparse"] = "nccl"
     """The backend to use for weight transfer. "cxl" reads each TP worker's weights
     directly from a shared canonical weight store (mmap/CXL), bypassing the NCCL
     broadcast and the per-GPU bucket IPC hop."""

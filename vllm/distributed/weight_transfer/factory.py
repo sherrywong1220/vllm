@@ -126,3 +126,10 @@ WeightTransferEngineFactory.register_engine(
     "vllm.distributed.weight_transfer.cxl_engine",
     "CXLWeightTransferEngine",
 )
+
+# P5 transport ablation: the CXL change set over the trainer->worker NCCL group.
+WeightTransferEngineFactory.register_engine(
+    "nccl_sparse",
+    "vllm.distributed.weight_transfer.nccl_sparse_engine",
+    "NCCLSparseWeightTransferEngine",
+)

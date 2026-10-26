@@ -203,6 +203,15 @@ class CXLWeightTransferEngine(
         self._read_prof = _on("WT_CXL_READ_CPROFILE", lambda v: v not in ("0", ""),
                               "ENABLE_READ_PROF")
         self._recv_idx = 0  # receive_weights call counter (0 = warmup, excluded like WSPHASE)
+        # P5 sparse change set (design claude_log/weight_sync/p5_sparse_change_set_design.md §1.4.3):
+        # the store carries per-trainer-rank change sets next to the dense anchor; version 1 is the
+        # dense read above, every later version (is_checkpoint_format=False) patches the resident
+        # bf16 weights in place.
+        self._cs_world: int | None = None  # trainer world encoded in the manifest; None = no change set
+        self._model = None  # the live vLLM model, cached on the dense call (load_weights.__self__)
+        self._last_version = 0  # last version consumed (dense or sparse); sparse needs +1 continuity
+        self._cs_reader = None  # ChangeSetReader
+        self._cs_plans: list | None = None  # DstPlan per owner, built once from the live model
 
     def _prof_emit(self, line: str) -> None:
         """Emit an attribution line to BOTH stdout (ray, if it forwards) and a file on
@@ -250,10 +259,13 @@ class CXLWeightTransferEngine(
                         f"{_OPEN_TIMEOUT_S}s: {e}"
                     ) from e
                 time.sleep(0.2)
+        from shared_weight_store.change_set import cs_world, is_cs_name
+
         self._owner_names = [
-            t.name for t in self._store.manifest.tensors if t.alias_of is None
+            t.name for t in self._store.manifest.tensors if t.alias_of is None and not is_cs_name(t.name)
         ]
         self._specs = {t.name: t for t in self._store.manifest.tensors}  # full shapes (P3A)
+        self._cs_world = cs_world(self._store.manifest)  # P5: None unless the trainer publishes change sets
         # P2 one-hop read: page-lock the store payload span so each tensor can DMA
         # straight store->cuda (no pinned-CPU stage), reusing P1B's mechanism on the
         # read side. Best-effort: if registration fails (e.g. the gpudirect WRITER
@@ -315,6 +327,12 @@ class CXLWeightTransferEngine(
         self._ensure_open()
 
         version = update_info.version
+        if not update_info.is_checkpoint_format:
+            self._receive_sparse(version)  # P5: in-place patch, no layerwise reload, no model.load_weights
+            return
+        model_obj = getattr(load_weights, "__self__", None)
+        if model_obj is not None:
+            self._model = model_obj  # P5 anchor: the sparse path patches this model's live parameters
         # P6 attribution (ALWAYS-ON, WSPHASE-class): D4d decomposes into exactly two
         # parts — the reader blocked on the trainer's write+commit, and the read loop
         # itself. Archived logs put the former at ~70% of D4d (and the veRL server
@@ -615,6 +633,7 @@ class CXLWeightTransferEngine(
                 f"count={len(self._owner_names)} digest={digest:08x}",
                 flush=True,
             )
+        self._last_version = version
         logger.info(
             "CXL receive_weights v%d: %.2f GB from %d tensors in %.2fs",
             version,
@@ -622,6 +641,94 @@ class CXLWeightTransferEngine(
             len(self._owner_names),
             time.perf_counter() - t0,
         )
+
+    # -- P5 sparse path ---------------------------------------------------------------------
+
+    def _receive_sparse(self, version: int) -> None:
+        """Apply version ``version``'s change sets (every trainer rank's) to the resident weights.
+
+        Precondition: this worker holds the bf16 rendition of ``version - 1`` (it read version 1
+        densely and applied every version since). The change set is the elements whose bf16 bits
+        changed; applying it reproduces a dense reload bitwise (the in-situ C2 below checks it).
+        """
+        from shared_weight_store.change_set import ChangeSetReader, owner_specs
+
+        _t_wait = time.perf_counter()
+        self._store.wait_committed(min_version=version, timeout_s=_WAIT_TIMEOUT_S)
+        _wait_s = time.perf_counter() - _t_wait
+        if self._cs_world is None:
+            raise RuntimeError("P5: a sparse version was requested but the store has no change-set regions")
+        if self._model is None:
+            raise RuntimeError("P5: sparse version before any dense version (no anchor on this worker)")
+        if version != self._last_version + 1:
+            raise RuntimeError(
+                f"P5: version gap {self._last_version} -> {version}: a change set applies only to the "
+                "immediately preceding version (no ring, by design)"
+            )
+        _idx = self._recv_idx
+        self._recv_idx += 1
+        use_cuda = torch.cuda.is_available()
+        dev = torch.device("cuda") if use_cuda else torch.device("cpu")
+        if self._cs_reader is None:
+            owners = owner_specs(self._store.manifest)
+            assert [o.name for o in owners] == self._owner_names
+            self._cs_reader = ChangeSetReader(owners, self._cs_world)
+            self._cs_plans = self._build_sparse_plan(self._model, owners)
+        slot = self._store.active_slot
+        t0 = time.perf_counter()
+        entries = self._cs_reader.read(self._store, slot, dev)
+        if use_cuda:
+            torch.cuda.synchronize()
+        t_read = time.perf_counter()
+        res = self._cs_reader.apply(entries, self._cs_plans)
+        if use_cuda:
+            torch.cuda.synchronize()
+        t_end = time.perf_counter()
+        self._last_version = version
+        if self._is_tp_rank0():
+            # Same keys as the dense path so run_bench's collector and the node-health canary keep working.
+            self._prof_emit(
+                f"[WSPHASE-CXL-READ idx={_idx}] D4d_wait_committed={_wait_s:.3f}s "
+                f"D4d_read_loop={t_end - t0:.3f}s "
+                f"read_gb={entries.bytes_read / 1e9:.6f}")
+            n_el = sum(self._cs_reader.n_elems)
+            self._prof_emit(
+                f"[WSPHASE-CXL-SPARSE idx={_idx}] version={version} trainer_world={self._cs_world} "
+                f"nnz={sum(entries.nnz_per_rank)} nnz_per_rank={entries.nnz_per_rank} "
+                f"density={sum(entries.nnz_per_rank) / max(n_el, 1):.5f} applied={res['applied']} "
+                f"dropped={res['dropped']} owners_touched={res['owners']} "
+                f"read_s={t_read - t0:.4f} apply_s={t_end - t_read:.4f} bytes={entries.bytes_read}")
+        if os.environ.get("WT_CXL_C2", "0") == "1":
+            self._c2_sparse_check(slot, version, dev)
+
+    def _c2_sparse_check(self, slot: int, version: int, dev) -> None:
+        """Tier-S oracle for P5: after the patch, re-read every owner densely (the fp32 anchor, cast
+        on this GPU exactly as the dense path casts) and compare this rank's slice with the resident
+        parameter, bitwise. A mismatch is weight corruption and raises."""
+        from vllm.distributed.weight_transfer.sparse_plan import c2_compare, plan_slice
+
+        bad, checked, max_abs = [], 0, 0.0
+        for name, plan in zip(self._owner_names, self._cs_plans):
+            if plan.dst is None:
+                continue
+            want = plan_slice(plan, self._store.region_view(slot, name)).to(dev, non_blocking=False).to(torch.bfloat16)
+            checked += 1
+            n_bad, mx = c2_compare(plan, want)
+            if n_bad:
+                max_abs = max(max_abs, mx)
+                bad.append((name, n_bad))
+        if self._is_tp_rank0() or bad:
+            print(f"[WT-CXL-P5-C2] version={version} checked={checked} mismatched_params={len(bad)} "
+                  f"max_abs_diff={max_abs:.3e} sample={bad[:4]}", flush=True)
+        if bad:
+            raise RuntimeError(f"P5 C2: sparse apply != dense reload for {len(bad)} params at v{version}: {bad[:4]}")
+
+    def _build_sparse_plan(self, model, owners) -> list:
+        """One ``DstPlan`` per store owner (``sparse_plan.build_sparse_plan``: shared with the NCCL
+        transport ablation so both arms apply the same change set under the same placement)."""
+        from vllm.distributed.weight_transfer.sparse_plan import build_sparse_plan
+
+        return build_sparse_plan(model, owners)
 
     def _build_plan(self, model) -> None:
         """Classify every store owner tensor (§1.1 accounting) and build the per-rank
@@ -871,14 +978,9 @@ class CXLWeightTransferEngine(
 
     @staticmethod
     def _sliceable(p) -> bool:
-        """A param is TP-sliceable only if unquantized/unpacked — quantized (GPTQ/AWQ/
-        Marlin/FP8) and bitsandbytes params carry a kernel-tiled/packed layout whose
-        shape differs from the logical one for reasons unrelated to TP, so they must go
-        through the framework loader + ``process_weights_after_loading`` (P3D)."""
-        return (
-            not getattr(p, "use_bitsandbytes_4bit", False)
-            and getattr(p, "packed_dim", None) is None
-        )
+        from vllm.distributed.weight_transfer.sparse_plan import sliceable
+
+        return sliceable(p)
 
     @staticmethod
     def _merged_column_target(model, name, params):
@@ -930,35 +1032,9 @@ class CXLWeightTransferEngine(
 
     @staticmethod
     def _vocab_target(name, param, modules):
-        """If store owner ``name`` is a vocab-parallel weight (``embed_tokens``/
-        ``lm_head`` on a ``VocabParallelEmbedding`` module), return the geometry
-        ``(org_vocab_start_index, org_vocab_end_index, num_embeddings_per_partition)``
-        for :func:`vocab_slice_plan`; else ``None`` (→ unchanged full read, P3D).
+        from vllm.distributed.weight_transfer.sparse_plan import vocab_target
 
-        The boundaries are read off the live module's ``shard_indices`` — the single
-        source of truth for the **padded** vocab layout. They are NOT ``even_shard`` of
-        the vocab: vLLM shards the padded dim then min's the org boundaries down, so a
-        rank near the padding boundary owns fewer (or zero) org rows (see
-        p3a4_vocab_slice_design.md §3.2). Duck-typed on ``shard_indices`` +
-        ``num_embeddings_per_partition`` (no ``isinstance`` coupling); a module lacking
-        them (e.g. a row/column linear) returns ``None`` and falls through."""
-        if getattr(param, "output_dim", None) is None:
-            return None  # replicated / no shardable output dim → full read
-        if not name.endswith(".weight"):
-            return None
-        module = modules.get(name[: -len(".weight")])
-        si = getattr(module, "shard_indices", None)
-        part = getattr(module, "num_embeddings_per_partition", None)
-        if si is None or part is None:
-            return None  # not a VocabParallelEmbedding → full read (P3D)
-        try:
-            return (
-                int(si.org_vocab_start_index),
-                int(si.org_vocab_end_index),
-                int(part),
-            )
-        except AttributeError:
-            return None
+        return vocab_target(name, param, modules)
 
     @staticmethod
     def _is_tp_rank0() -> bool:
