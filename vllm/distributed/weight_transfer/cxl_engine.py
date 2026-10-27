@@ -626,13 +626,19 @@ class CXLWeightTransferEngine(
             # bitwise. Slice path: this rank only read its slice, so the digest is NOT
             # comparable to send-over-full — labelled role=recv-sliced and excluded
             # from the equality oracle (its bitwise gate is C1b test_slice_plan; its
-            # runtime oracle is generation-match). One print from TP rank 0.
+            # runtime oracle is C2-SLICE below). One print from TP rank 0.
             role = "recv-sliced" if (plan or ep_plan) else "recv"
             print(
                 f"[WT-CXL-C2] role={role} version={version} "
                 f"count={len(self._owner_names)} digest={digest:08x}",
                 flush=True,
             )
+        if c2 and plan and not ep_plan:
+            # C2-SLICE (design p4 §1.12): every TP rank compares its resident slices with
+            # its slice of the store, the check P5-C2 runs after a sparse patch. A layer
+            # whose weights all arrived was processed inside load_weights; one vLLM defers
+            # to finalize_layerwise_reload is refused by _resident_plans.
+            self._c2_resident_check(slot, version, torch.device("cuda" if use_cuda else "cpu"), "C2-SLICE")
         self._last_version = version
         logger.info(
             "CXL receive_weights v%d: %.2f GB from %d tensors in %.2fs",
@@ -670,17 +676,15 @@ class CXLWeightTransferEngine(
         use_cuda = torch.cuda.is_available()
         dev = torch.device("cuda") if use_cuda else torch.device("cpu")
         if self._cs_reader is None:
-            owners = owner_specs(self._store.manifest)
-            assert [o.name for o in owners] == self._owner_names
-            self._cs_reader = ChangeSetReader(owners, self._cs_world)
-            self._cs_plans = self._build_sparse_plan(self._model, owners)
+            self._cs_reader = ChangeSetReader(owner_specs(self._store.manifest), self._cs_world)
+        plans = self._resident_plans()
         slot = self._store.active_slot
         t0 = time.perf_counter()
         entries = self._cs_reader.read(self._store, slot, dev)
         if use_cuda:
             torch.cuda.synchronize()
         t_read = time.perf_counter()
-        res = self._cs_reader.apply(entries, self._cs_plans)
+        res = self._cs_reader.apply(entries, plans)
         if use_cuda:
             torch.cuda.synchronize()
         t_end = time.perf_counter()
@@ -699,19 +703,39 @@ class CXLWeightTransferEngine(
                 f"dropped={res['dropped']} owners_touched={res['owners']} "
                 f"read_s={t_read - t0:.4f} apply_s={t_end - t_read:.4f} bytes={entries.bytes_read}")
         if os.environ.get("WT_CXL_C2", "0") == "1":
-            self._c2_sparse_check(slot, version, dev)
+            self._c2_resident_check(slot, version, dev, "P5-C2")
 
-    def _c2_sparse_check(self, slot: int, version: int, dev) -> None:
-        """Tier-S oracle for P5: after the patch, re-read every owner densely (the fp32 anchor, cast
-        on this GPU exactly as the dense path casts) and compare this rank's slice with the resident
-        parameter, bitwise. A mismatch is weight corruption and raises."""
+    def _resident_plans(self) -> list:
+        """The ``DstPlan`` of every owner on this TP rank, built once from the live model. The kernel tensors it
+        holds survive every layerwise reload (vLLM copies into them, for CUDA graphs). Built at the end of a dense
+        read, a layer vLLM defers to ``finalize_layerwise_reload`` (a weight with unloaded padding) is still on the
+        meta device and gets its values after this engine returns: refused, never compared stale."""
+        if self._cs_plans is None:
+            from shared_weight_store.change_set import owner_specs
+
+            owners = owner_specs(self._store.manifest)
+            assert [o.name for o in owners] == self._owner_names
+            plans = self._build_sparse_plan(self._model, owners)
+            meta = [o.name for o, pl in zip(owners, plans) if pl.dst is not None and pl.dst.is_meta]
+            if meta:
+                raise RuntimeError(f"C2: {len(meta)} owners are not loaded until finalize_layerwise_reload, after "
+                                   f"receive_weights returns (e.g. {meta[:4]}): no resident value to compare")
+            self._cs_plans = plans
+        return self._cs_plans
+
+    def _c2_resident_check(self, slot: int, version: int, dev, tag: str) -> None:
+        """Tier-S oracle: re-read every owner densely from the store (the fp32 anchor, cast on this GPU exactly as
+        the dense path casts) and compare this rank's slice with the resident parameter, bitwise. ``P5-C2`` after a
+        sparse patch; ``C2-SLICE`` after a TP-slice dense read, whose digest covers the slice only. On the pool the
+        rollout hosts never write, so the invalidate below only drops lines: it reads what the pool holds. A
+        mismatch is weight corruption and raises."""
         from vllm.distributed.weight_transfer.sparse_plan import c2_compare, plan_slice
 
         bad, checked, max_abs = [], 0, 0.0
         # P4 rule 3 (no-op off the pool): plan_slice gathers a column slice with the CPU (and on a CPU device the
         # whole read is the CPU's) — invalidate the region before the read and after it
         flush = self._store.flush
-        for name, plan in zip(self._owner_names, self._cs_plans):
+        for name, plan in zip(self._owner_names, self._resident_plans()):
             if plan.dst is None:
                 continue
             region = self._store.region_view(slot, name)
@@ -724,10 +748,11 @@ class CXLWeightTransferEngine(
                 max_abs = max(max_abs, mx)
                 bad.append((name, n_bad))
         if self._is_tp_rank0() or bad:
-            print(f"[WT-CXL-P5-C2] version={version} checked={checked} mismatched_params={len(bad)} "
+            print(f"[WT-CXL-{tag}] version={version} checked={checked} mismatched_params={len(bad)} "
                   f"max_abs_diff={max_abs:.3e} sample={bad[:4]}", flush=True)
         if bad:
-            raise RuntimeError(f"P5 C2: sparse apply != dense reload for {len(bad)} params at v{version}: {bad[:4]}")
+            raise RuntimeError(f"{tag}: the resident weights != this rank's slice of the store for {len(bad)} params "
+                               f"at v{version}: {bad[:4]}")
 
     def _build_sparse_plan(self, model, owners) -> list:
         """One ``DstPlan`` per store owner (``sparse_plan.build_sparse_plan``: shared with the NCCL
