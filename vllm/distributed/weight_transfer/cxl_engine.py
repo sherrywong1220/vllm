@@ -708,10 +708,16 @@ class CXLWeightTransferEngine(
         from vllm.distributed.weight_transfer.sparse_plan import c2_compare, plan_slice
 
         bad, checked, max_abs = [], 0, 0.0
+        # P4 rule 3 (no-op off the pool): plan_slice gathers a column slice with the CPU (and on a CPU device the
+        # whole read is the CPU's) — invalidate the region before the read and after it
+        flush = self._store.flush
         for name, plan in zip(self._owner_names, self._cs_plans):
             if plan.dst is None:
                 continue
-            want = plan_slice(plan, self._store.region_view(slot, name)).to(dev, non_blocking=False).to(torch.bfloat16)
+            region = self._store.region_view(slot, name)
+            flush(region)
+            want = plan_slice(plan, region).to(dev, non_blocking=False).to(torch.bfloat16)
+            flush(region)
             checked += 1
             n_bad, mx = c2_compare(plan, want)
             if n_bad:
