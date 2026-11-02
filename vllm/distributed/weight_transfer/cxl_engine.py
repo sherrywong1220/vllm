@@ -125,9 +125,16 @@ def ep_bridge_direct(entry: _EPEntry, run, block: torch.Tensor) -> int:
 
 @dataclass
 class CXLWeightTransferInitInfo(WeightTransferInitInfo):
-    """One field: where the shared canonical store lives."""
+    """Where the shared canonical store lives, and which rollout replica this is.
+    The replica index and count feed the P4 reader rotation (design §1.13): on a
+    pool of many memory devices the store spreads its tensors over the devices,
+    and readers that walk the manifest in the same order would all hit the same
+    device at the same time. Reader ``replica * TP + tp_rank`` of ``n_replicas * TP``
+    starts its read loop on a different segment. Unsegmented stores ignore it."""
 
     store_uri: str = ""
+    replica_index: int = 0
+    n_replicas: int = 1
 
 
 @dataclass
@@ -196,7 +203,8 @@ class CXLWeightTransferEngine(
         self._classes: dict[str, str] = {}  # owner name -> tp | expert | repl (§1.1 accounting)
         self._class_bytes: dict[str, int] = {"tp": 0, "expert": 0, "repl": 0}
         self._param_names: set[str] | None = None  # model params, for the coverage oracle
-        self._world: dict = {"tp": 1, "ep": 1, "dp": 1, "ep_rank": 0}
+        self._world: dict = {"tp": 1, "ep": 1, "dp": 1, "ep_rank": 0, "tp_rank": 0}
+        self._replica = (0, 1)  # (replica index, replicas) from init_info: the §1.13 reader rotation
         self._coaxial: str = "na"
         # D4d attribution: split residual read cost F into GPU-copy vs Python-dispatch to
         # decide P3B vs batching the loads. Instrumented → attribution-only, never a verdict.
@@ -233,7 +241,9 @@ class CXLWeightTransferEngine(
         if not init_info.store_uri:
             raise ValueError("CXL weight transfer needs a non-empty store_uri")
         self._store_uri = init_info.store_uri
-        logger.info("CXL weight transfer engine: store_uri=%s", self._store_uri)
+        self._replica = (init_info.replica_index, init_info.n_replicas)
+        logger.info("CXL weight transfer engine: store_uri=%s replica=%d/%d", self._store_uri,
+                    *self._replica)
 
     def _ensure_open(self):
         if self._store is not None:
@@ -405,7 +415,7 @@ class CXLWeightTransferEngine(
         n_ep_runs = n_ep_calls = 0
 
         t0 = time.perf_counter()
-        for name in self._owner_names:
+        for name in self._read_order(_idx == 0):
             _ts = time.perf_counter() if _do_split else 0.0
             cls = self._classes.get(name, "repl")
             ep = ep_plan.get(name)
@@ -650,6 +660,21 @@ class CXLWeightTransferEngine(
 
     # -- P5 sparse path ---------------------------------------------------------------------
 
+    def _read_order(self, log: bool) -> list[str]:
+        """The owner names in this reader's order (P4 design §1.13 / C-12): on a segmented store
+        (one segment per memory device) reader ``replica * TP + tp_rank`` of ``n_replicas * TP``
+        starts on segment ``reader * S // n_readers``, so concurrent readers pull from different
+        devices instead of queueing on the same one. Every name is still read exactly once; an
+        unsegmented store (one device, memfd emulation) gives the manifest order back unchanged."""
+        r, n = self._replica
+        tp, tp_rank = self._world["tp"], self._world["tp_rank"]
+        names = self._store.read_order(self._owner_names, r * tp + tp_rank, n * tp)
+        if log and self._store.n_segments > 1 and self._is_tp_rank0():
+            print(f"[WT-CXL] P4 reader rotation: reader {r * tp + tp_rank}/{n * tp} "
+                  f"(replica {r}/{n}, tp {tp_rank}/{tp}) segments={self._store.n_segments} "
+                  f"first={names[0]} (segment {self._store.segment_of(names[0])})", flush=True)
+        return names
+
     def _receive_sparse(self, version: int) -> None:
         """Apply version ``version``'s change sets (every trainer rank's) to the resident weights.
 
@@ -805,6 +830,7 @@ class CXLWeightTransferEngine(
         except Exception:
             tp_rank, tp_size = 0, 1
         self._world["tp"] = tp_size
+        self._world["tp_rank"] = tp_rank
 
         params = dict(model.named_parameters())
         self._param_names = set(params)
