@@ -133,3 +133,16 @@ WeightTransferEngineFactory.register_engine(
     "vllm.distributed.weight_transfer.nccl_sparse_engine",
     "NCCLSparseWeightTransferEngine",
 )
+
+# Paper baselines (bench/cxl_real/arms.py): store over RDMA, and Meta's WeightBridge driven from veRL.
+WeightTransferEngineFactory.register_engine(
+    "rs_store",
+    "vllm.distributed.weight_transfer.rs_engine",
+    "RSStoreWeightTransferEngine",
+)
+
+WeightTransferEngineFactory.register_engine(
+    "wbridge",
+    "vllm.distributed.weight_transfer.wbridge_engine",
+    "WBridgeWeightTransferEngine",
+)

@@ -243,6 +243,7 @@ class CXLWeightTransferEngine(
         from shared_weight_store.gpu_h2d import slice_h2d
 
         self._slice_h2d = slice_h2d  # guarded pitched-DMA / copy_ for slice reads (P3A)
+        self._full_h2d = lambda region, tensor: tensor.copy_(region, non_blocking=True)  # rs_engine replaces both
 
         deadline = time.monotonic() + _OPEN_TIMEOUT_S
         while True:
@@ -495,7 +496,7 @@ class CXLWeightTransferEngine(
                 if c2:
                     digest = _digest(digest, name, region)
                 tensor = torch.empty(region.shape, dtype=region.dtype, device="cuda")
-                tensor.copy_(region, non_blocking=True)
+                self._full_h2d(region, tensor)
                 total_bytes += region.nbytes
                 read_by_class[cls] += region.nbytes
             elif use_cuda:
