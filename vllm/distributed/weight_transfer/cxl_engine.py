@@ -661,18 +661,19 @@ class CXLWeightTransferEngine(
     # -- P5 sparse path ---------------------------------------------------------------------
 
     def _read_order(self, log: bool) -> list[str]:
-        """The owner names in this reader's order (P4 design §1.13 / C-12): on a segmented store
+        """The owner names in this reader's order (P4 design §1.13.8 / C-12): on a segmented store
         (one segment per memory device) reader ``replica * TP + tp_rank`` of ``n_replicas * TP``
-        starts on segment ``reader * S // n_readers``, so concurrent readers pull from different
-        devices instead of queueing on the same one. Every name is still read exactly once; an
-        unsegmented store (one device, memfd emulation) gives the manifest order back unchanged."""
+        sweeps segment-major from segment ``reader * S // n_readers`` (``store.read_order``: every
+        tensor of a device before the next), so concurrent readers start on different devices and
+        stay apart for the whole read. Every name is still read exactly once; an unsegmented store
+        (one device, memfd emulation) gives the manifest order back unchanged."""
         r, n = self._replica
         tp, tp_rank = self._world["tp"], self._world["tp_rank"]
         names = self._store.read_order(self._owner_names, r * tp + tp_rank, n * tp)
         if log and self._store.n_segments > 1 and self._is_tp_rank0():
             print(f"[WT-CXL] P4 reader rotation: reader {r * tp + tp_rank}/{n * tp} "
                   f"(replica {r}/{n}, tp {tp_rank}/{tp}) segments={self._store.n_segments} "
-                  f"first={names[0]} (segment {self._store.segment_of(names[0])})", flush=True)
+                  f"first={names[0]} (segment {self._store.segment_of(names[0])}) order=segment-major", flush=True)
         return names
 
     def _receive_sparse(self, version: int) -> None:
