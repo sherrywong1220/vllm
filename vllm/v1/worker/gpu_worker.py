@@ -986,6 +986,8 @@ class Worker(WorkerBase):
                     param = model.get_parameter(name)
                     param.copy_(weight)
 
+            # An engine that patches or probes the live model (wbridge) has no other handle to it on this path.
+            load_weights_direct.model = model
             self.weight_transfer_engine.receive_weights(
                 typed_update_info,
                 load_weights=load_weights_direct,
