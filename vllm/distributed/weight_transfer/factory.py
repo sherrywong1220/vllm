@@ -146,3 +146,10 @@ WeightTransferEngineFactory.register_engine(
     "vllm.distributed.weight_transfer.wbridge_engine",
     "WBridgeWeightTransferEngine",
 )
+
+# Paper baseline: AReaL-DTE's point-to-point deltas, the receiving end of veRL's "dte" checkpoint engine.
+WeightTransferEngineFactory.register_engine(
+    "dte",
+    "vllm.distributed.weight_transfer.dte_engine",
+    "DTEWeightTransferEngine",
+)
