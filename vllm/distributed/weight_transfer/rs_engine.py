@@ -65,9 +65,9 @@ class RSStoreWeightTransferEngine(CXLWeightTransferEngine):
         self._store_uri = "rs_store"
 
     def _memfd_store(self, name, manifest):
-        from shared_weight_store import CanonicalWeightStore
+        from shared_weight_store import CanonicalWeightStore, numa
 
-        fd = os.memfd_create(name, os.MFD_CLOEXEC)
+        fd = numa.memfd_create(name)
         return CanonicalWeightStore.create(f"mmap:///proc/{os.getpid()}/fd/{fd}", manifest, n_slots=1)
 
     def _ensure_open(self):
