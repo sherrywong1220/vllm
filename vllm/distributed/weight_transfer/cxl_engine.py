@@ -960,28 +960,9 @@ class CXLWeightTransferEngine(
 
     @staticmethod
     def _ep_target(name, spec, params, modules):
-        """If store owner ``name`` is a fused 3D routed-expert param of a FusedMoE
-        layer on this model, return ``(kind, module, param, param_name)`` with
-        ``kind`` ∈ {``w13``, ``w2``}; else ``None``. Duck-typed on the module having a
-        ``weight_loader`` and an ``_expert_map`` attribute (FusedMoE); no
-        ``isinstance`` coupling."""
-        if len(spec.shape) != 3:
-            return None
-        if name.endswith(".mlp.experts.gate_up_proj"):
-            kind, pfx = "w13", "w13_weight"
-        elif name.endswith(".mlp.experts.down_proj"):
-            kind, pfx = "w2", "w2_weight"
-        else:
-            return None
-        mod_name = name.rsplit(".", 1)[0]
-        module = modules.get(mod_name)
-        if module is None or not hasattr(module, "weight_loader") or not hasattr(module, "_expert_map"):
-            return None
-        pname = f"{mod_name}.{pfx}"
-        param = params.get(pname)
-        if param is None:
-            return None
-        return kind, module, param, pname
+        from vllm.distributed.weight_transfer.sparse_plan import expert_target
+
+        return expert_target(name, spec.shape, params, modules)
 
     def _tp_target(self, name, spec, params, modules, tp_rank, tp_size,
                    row_slice_plan, column_slice_plan, qkv_slice_plan, vocab_slice_plan):

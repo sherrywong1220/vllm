@@ -6,7 +6,8 @@ A change set carries CANONICAL element indices (the HF-shaped tensor's flat inde
 loaders are copy-based and cannot take indices, so each engine needs, per store owner, the
 rule that maps canonical ``(row, col)`` onto this TP rank's live parameter: row-parallel
 column slice, merged-column / fused-qkv row slice at the fused offset, padded vocab rows,
-replicated identity. The rule is derived once from the live model here and applied by
+replicated identity, a MoE's fused 3D experts at this EP rank's local slots. The rule is
+derived once from the live model here and applied by
 ``shared_weight_store.change_set.ChangeSetReader.apply``; the transport (shared store or NCCL)
 only decides how the entries arrive. Anything unknown raises — never a silent mis-place.
 """
@@ -57,6 +58,73 @@ def vocab_target(name, param, modules):
         return None
 
 
+def expert_target(name, shape, params, modules):
+    """If store owner ``name`` is a fused 3D routed-expert tensor of a FusedMoE layer on this
+    model (HF transformers >= 5: ``mlp.experts.gate_up_proj`` ``[E, 2I, H]`` / ``down_proj``
+    ``[E, H, I]``), return ``(kind, module, param, param_name)`` with ``kind`` in {``w13``,
+    ``w2``}; else ``None``. Duck-typed on the module having a ``weight_loader`` and an
+    ``_expert_map`` attribute (FusedMoE); no ``isinstance`` coupling. One rule for the dense
+    EP-slice read (P7) and the sparse plan below."""
+    if len(shape) != 3:
+        return None
+    if name.endswith(".mlp.experts.gate_up_proj"):
+        kind, pfx = "w13", "w13_weight"
+    elif name.endswith(".mlp.experts.down_proj"):
+        kind, pfx = "w2", "w2_weight"
+    else:
+        return None
+    mod_name = name.rsplit(".", 1)[0]
+    module = modules.get(mod_name)
+    if module is None or not hasattr(module, "weight_loader") or not hasattr(module, "_expert_map"):
+        return None
+    pname = f"{mod_name}.{pfx}"
+    param = params.get(pname)
+    if param is None:
+        return None
+    return kind, module, param, pname
+
+
+def expert_plan(name, S, mod, p, pname):
+    """The ``DstPlan`` of fused 3D expert owner ``name`` ``[E, ...]`` on ``p``, this rank's
+    ``[E_local, ...]`` parameter (design p5 §1.8). A canonical row is one expert, so expert
+    parallelism is a dim-0 placement: experts ``[g0, g0 + n)`` land at local slots
+    ``[l0, l0 + n)``. Ownership is read off the engine's live ``_expert_map``, never recomputed
+    from config (p7 §3.2). A ``DstPlan`` holds one interval, so only a placement with one run
+    per rank (``linear``) is patchable, and the values must sit in the parameter in the
+    canonical layout (whole experts, ``[gate; up]`` rows). Everything else raises: a change set
+    has no dense fallback, and a mis-placed expert is silent."""
+    from shared_weight_store.change_set import DstPlan
+    from shared_weight_store.expert_plan import expert_runs
+
+    if not sliceable(p):
+        raise RuntimeError(f"P5: expert param '{pname}' is quantized/packed; not patchable")
+    backend = getattr(getattr(mod, "quant_method", None), "unquantized_backend", None)
+    if backend is not None and backend.name != "TRITON":
+        raise RuntimeError(f"P5: '{pname}' is in the {backend.name} kernel's weight layout, not the canonical "
+                           "[gate; up] one; not patchable")
+    if getattr(mod, "enable_eplb", False):
+        raise RuntimeError(f"P5: '{pname}' is under EPLB (the expert placement changes at runtime); not patchable")
+    if tuple(p.shape[1:]) != tuple(S[1:]):
+        raise RuntimeError(f"P5: '{name}' {S}: the per-expert shape of '{pname}' is {tuple(p.shape[1:])} "
+                           "(TP inside the MoE layer); only whole experts are placed")
+    emap = getattr(mod, "_expert_map", None)
+    if emap is None:  # no expert parallelism: every expert, in order
+        if p.shape[0] != S[0]:
+            raise RuntimeError(f"P5: '{pname}' holds {p.shape[0]} experts, '{name}' has {S[0]}, and there is no expert map")
+        return DstPlan.identity(p, S)
+    emap = emap.tolist()
+    if len(emap) != S[0]:
+        raise RuntimeError(f"P5: the expert map of '{pname}' maps {len(emap)} experts, '{name}' has {S[0]}")
+    runs = expert_runs(emap)
+    if len(runs) > 1:
+        raise RuntimeError(f"P5: this rank's experts of '{name}' are {len(runs)} runs (expert placement is not "
+                           "linear); the sparse plan places one contiguous run")
+    g0, l0, n = (runs[0].global_start, runs[0].local_start, runs[0].count) if runs else (0, 0, 0)
+    if p.shape[0] != n:
+        raise RuntimeError(f"P5: '{pname}' holds {p.shape[0]} experts, its expert map gives this rank {n}")
+    return DstPlan.rows(p, S, g0, n, l0)
+
+
 def is_tp_rank0() -> bool:
     try:
         from vllm.distributed import get_tensor_model_parallel_rank
@@ -87,7 +155,7 @@ def build_sparse_plan(model, owners, tag: str = "P5") -> list:
     params = dict(model.named_parameters())
     modules = dict(model.named_modules())
     mapping = getattr(model, "packed_modules_mapping", None) or {}
-    plans, kinds = [], {"row": 0, "col": 0, "qkv": 0, "vocab": 0, "repl": 0}
+    plans, kinds = [], {"row": 0, "col": 0, "qkv": 0, "vocab": 0, "repl": 0, "expert": 0}
 
     def _bf16(p, name):
         if p.dtype != torch.bfloat16:
@@ -120,6 +188,12 @@ def build_sparse_plan(model, owners, tag: str = "P5") -> list:
                 kinds["col"] += 1
             else:
                 raise RuntimeError(f"P5: cannot place '{name}' {S} onto param {tuple(p.shape)} (tp={tp_size})")
+            continue
+        ep = expert_target(name, S, params, modules)
+        if ep is not None:  # fused 3D routed experts of a MoE: this rank's experts, by the engine's expert map
+            _, mod, ep_p, pname = ep
+            plans.append(expert_plan(name, S, mod, _bf16(ep_p, pname), pname))
+            kinds["expert"] += 1
             continue
         # fused constituent: q/k/v -> qkv_proj, gate/up -> gate_up_proj (weight or bias)
         placed = False
