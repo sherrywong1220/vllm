@@ -123,7 +123,7 @@ class NCCLSparseWeightTransferEngine(NCCLWeightTransferEngine):
     def _receive_sparse(self, version: int) -> None:
         """Apply version ``version``'s change sets (every trainer rank's) to the resident weights.
         Precondition: this worker holds the bf16 rendition of ``version - 1``."""
-        from shared_weight_store.change_set import ChangeSetReader
+        from shared_weight_store.change_set import ChangeSetReader, read_chunk
 
         if self._owners is None or self._model is None:
             raise RuntimeError("NCCL sparse: sparse version before the dense anchor (no manifest on this worker)")
@@ -157,11 +157,9 @@ class NCCLSparseWeightTransferEngine(NCCLWeightTransferEngine):
         blob = self._bcast(torch.empty(nbytes, dtype=torch.uint8, device=dev))
         self._sync()
         t_blob = time.perf_counter()
-        entries = self._reader.entries_from_blob(blob, ns, dev)
-        self._sync()
-        t_read = time.perf_counter()
-        res = self._reader.apply(entries, self._plans)
-        self._sync()
+        # One pass unless P5_READ_CHUNK (72B: one pass does not fit beside the engine and the blob)
+        res = self._reader.apply_passes(self._reader.blob_passes(blob, ns, dev, read_chunk()), self._plans,
+                                        self._sync)
         t_end = time.perf_counter()
         self._last_version = version
         if self._is_tp_rank0():
@@ -173,8 +171,8 @@ class NCCLSparseWeightTransferEngine(NCCLWeightTransferEngine):
             print(f"[WSPHASE-NCCLS-SPARSE idx={_idx}] version={version} trainer_world={W} "
                   f"nnz={sum(ns)} nnz_per_rank={ns} density={sum(ns) / max(n_el, 1):.5f} applied={res['applied']} "
                   f"dropped={res['dropped']} owners_touched={res['owners']} "
-                  f"read_s={t_read - t_hdr:.4f} apply_s={t_end - t_read:.4f} bytes={nbytes} "
-                  f"bcast_payload_s={t_blob - t_hdr:.4f}", flush=True)
+                  f"read_s={t_blob - t_hdr + res['read_s']:.4f} apply_s={res['apply_s']:.4f} bytes={nbytes} "
+                  f"bcast_payload_s={t_blob - t_hdr:.4f} passes={res['passes']}", flush=True)
         if c2:
             self._c2_dense_compare(version, dev)
 

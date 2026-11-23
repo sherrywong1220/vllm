@@ -644,11 +644,15 @@ class CXLWeightTransferEngine(
                 f"count={len(self._owner_names)} digest={digest:08x}",
                 flush=True,
             )
-        if c2 and plan and not ep_plan:
+        if c2 and (plan or ep_plan):
             # C2-SLICE (design p4 §1.12): every TP rank compares its resident slices with
             # its slice of the store, the check P5-C2 runs after a sparse patch. A layer
             # whose weights all arrived was processed inside load_weights; one vLLM defers
-            # to finalize_layerwise_reload is refused by _resident_plans.
+            # to finalize_layerwise_reload is refused by _resident_plans. The condition is
+            # the one of role=recv-sliced above: every version whose digest covers a slice
+            # only is checked here. That includes an EP-sliced read: the sparse plan places
+            # a MoE's fused experts on this rank's local slots (c652ca712), the same plan
+            # P5-C2 uses.
             self._c2_resident_check(slot, version, torch.device("cuda" if use_cuda else "cpu"), "C2-SLICE")
         self._last_version = version
         logger.info(
@@ -689,7 +693,7 @@ class CXLWeightTransferEngine(
         densely and applied every version since). The change set is the elements whose bf16 bits
         changed; applying it reproduces a dense reload bitwise (the in-situ C2 below checks it).
         """
-        from shared_weight_store.change_set import ChangeSetReader, owner_specs
+        from shared_weight_store.change_set import ChangeSetReader, owner_specs, read_chunk
 
         _t_wait = time.perf_counter()
         self._store.wait_committed(min_version=version, timeout_s=_WAIT_TIMEOUT_S)
@@ -711,14 +715,11 @@ class CXLWeightTransferEngine(
             self._cs_reader = ChangeSetReader(owner_specs(self._store.manifest), self._cs_world)
         plans = self._resident_plans()
         slot = self._store.active_slot
+        sync = torch.cuda.synchronize if use_cuda else (lambda: None)
         t0 = time.perf_counter()
-        entries = self._cs_reader.read(self._store, slot, dev)
-        if use_cuda:
-            torch.cuda.synchronize()
-        t_read = time.perf_counter()
-        res = self._cs_reader.apply(entries, plans)
-        if use_cuda:
-            torch.cuda.synchronize()
+        # One pass unless P5_READ_CHUNK (72B: one pass does not fit beside the engine)
+        res = self._cs_reader.apply_passes(self._cs_reader.read_passes(self._store, slot, dev, read_chunk()),
+                                           plans, sync)
         t_end = time.perf_counter()
         self._last_version = version
         if self._is_tp_rank0():
@@ -726,14 +727,16 @@ class CXLWeightTransferEngine(
             self._prof_emit(
                 f"[WSPHASE-CXL-READ idx={_idx}] D4d_wait_committed={_wait_s:.3f}s "
                 f"D4d_read_loop={t_end - t0:.3f}s "
-                f"read_gb={entries.bytes_read / 1e9:.6f}")
+                f"read_gb={res['bytes_read'] / 1e9:.6f}")
             n_el = sum(self._cs_reader.n_elems)
+            nnz = res["nnz_per_rank"]
             self._prof_emit(
                 f"[WSPHASE-CXL-SPARSE idx={_idx}] version={version} trainer_world={self._cs_world} "
-                f"nnz={sum(entries.nnz_per_rank)} nnz_per_rank={entries.nnz_per_rank} "
-                f"density={sum(entries.nnz_per_rank) / max(n_el, 1):.5f} applied={res['applied']} "
+                f"nnz={sum(nnz)} nnz_per_rank={nnz} "
+                f"density={sum(nnz) / max(n_el, 1):.5f} applied={res['applied']} "
                 f"dropped={res['dropped']} owners_touched={res['owners']} "
-                f"read_s={t_read - t0:.4f} apply_s={t_end - t_read:.4f} bytes={entries.bytes_read}")
+                f"read_s={res['read_s']:.4f} apply_s={res['apply_s']:.4f} bytes={res['bytes_read']} "
+                f"passes={res['passes']}")
         if os.environ.get("WT_CXL_C2", "0") == "1":
             self._c2_resident_check(slot, version, dev, "P5-C2")
 
