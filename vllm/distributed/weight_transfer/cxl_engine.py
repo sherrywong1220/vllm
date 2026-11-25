@@ -55,7 +55,9 @@ class _EPEntry:
 
     kind: str  # "w13" | "w2"
     runs: list  # [ExpertRun]: (global_start, local_start, count)
-    param: torch.nn.Parameter  # experts.w13_weight / w2_weight — this rank's [E_local, ...]
+    # experts.w13_weight / w2_weight, this rank's [E_local, ...]: the tensor the layer serves (ep_storage), which
+    # inside a layerwise reload is the kernel tensor, not the layer's meta placeholder
+    param: torch.nn.Parameter
     module: Any  # the FusedMoE layer (owns weight_loader + _expert_map)
     param_name: str
     n_local: int
@@ -121,6 +123,40 @@ def ep_bridge_direct(entry: _EPEntry, run, block: torch.Tensor) -> int:
         )
     dst.copy_(block)
     return run.count
+
+
+def ep_storage(module, attr: str, param: torch.Tensor) -> torch.Tensor | None:
+    """The tensor MoE layer ``module`` serves for ``attr`` (``w13_weight`` / ``w2_weight``). Every checkpoint-format
+    sync runs inside vLLM's layerwise reload, where the layer's parameter is a meta placeholder until vLLM processes
+    the layer, and a copy into it is lost. There the tensor is the kernel tensor the reload saved (the same one for
+    every sync: vLLM copies into it, for CUDA graphs). ``None`` if the reload saved none for ``attr``."""
+    if not param.is_meta:
+        return param
+    from vllm.model_executor.model_loader.reload.layerwise import get_layerwise_info
+
+    kernel = get_layerwise_info(module).kernel_tensors
+    return kernel[0].get(attr) if kernel is not None else None
+
+
+def ep_finish_reload(module) -> None:
+    """End vLLM's layerwise reload of a MoE layer whose experts the bridges wrote into its kernel tensors: put them
+    back on the layer, as ``_layerwise_process`` does after its copy. vLLM's own path would rebuild the layer from
+    loader calls and copy it into the same tensors; for the TRITON layout (the only one ``_build_plan`` slices)
+    ``process_weights_after_loading`` keeps the values as loaded, so the result is the same. Without this the layer
+    reaches ``finalize_layerwise_reload`` with no element counted, and vLLM puts the old values back ("Failed to load
+    weights"). Outside a reload the bridges wrote the live parameters: nothing to do."""
+    from vllm.model_executor.model_loader.reload.layerwise import _place_kernel_tensors, get_layerwise_info
+
+    info = get_layerwise_info(module)
+    if not info.can_load():
+        return
+    if info.load_numel:
+        raise RuntimeError(
+            f"P7 ep-slice: {info.load_numel} elements of a {type(module).__name__} came through vLLM's loader "
+            "beside the bridge; putting its kernel tensors back here would drop them"
+        )
+    _place_kernel_tensors(module, info)
+    info.reset()
 
 
 @dataclass
@@ -545,6 +581,9 @@ class CXLWeightTransferEngine(
                 _s_stage += _t1 - _ts      # H2D dispatch + GPU (≈ B, per-tensor)
                 _s_ldisp += _t2 - _t1      # load_weights Python dispatch (narrow skip + fused placement + copy_ launch)
                 _s_copygpu += _t3 - _t2    # param_data.copy_ GPU execution (the d2d placement copy)
+        # P7: the bridges wrote the MoE layers' kernel tensors; vLLM counted none of it, so end their reload here
+        for module in {id(e.module): e.module for e in ep_plan.values()}.values():
+            ep_finish_reload(module)
         if _instr:
             _t_pre = time.perf_counter()
         if use_cuda:
@@ -571,12 +610,14 @@ class CXLWeightTransferEngine(
         # C2 is RELATIVE (cxl vs nccl through one shared loader), so a name silently
         # dropped by the loader is invisible to it. This is the absolute check: every
         # model parameter was written this call, either by model.load_weights (names it
-        # returns) or by the EP bridge (every local expert slot of every MoE param).
+        # returns) or by the EP bridge (every local expert slot of every MoE param, into
+        # the tensor the layer now serves: a write into a reload placeholder is lost).
         if self._param_names is not None:
             covered = set(loaded)
             for pn, n in ep_written.items():
                 ep_entry = next((e for e in ep_plan.values() if e.param_name == pn), None)
-                if ep_entry is not None and n == ep_entry.n_local:
+                if (ep_entry is not None and n == ep_entry.n_local
+                        and getattr(ep_entry.module, pn.rsplit(".", 1)[1]) is ep_entry.param):
                     covered.add(pn)
             missing = self._param_names - covered
             if self._is_tp_rank0():
@@ -882,12 +923,15 @@ class CXLWeightTransferEngine(
                     continue
                 reason = None
                 emap = getattr(module, "_expert_map", None)
+                backend = getattr(getattr(module, "quant_method", None), "unquantized_backend", None)
                 if not getattr(module, "use_ep", False) or emap is None:
                     reason = "no-ep"
                 elif getattr(module, "enable_eplb", False):
                     reason = "eplb"  # plan would change at runtime (§3.8) — not this phase
                 elif not self._sliceable(param):
                     reason = "quantized"
+                elif backend is not None and backend.name != "TRITON":
+                    reason = "kernel-layout"  # its kernel reorders the experts on load; ep_finish_reload does not
                 elif tuple(param.shape[1:]) != tuple(spec.shape[1:]):
                     reason = "per-expert-shape"  # TP inside EP (moe_tensor_parallel) — loader narrows
                 else:
@@ -901,6 +945,10 @@ class CXLWeightTransferEngine(
                             reason = "local-count-mismatch"
                         elif tuple(param.shape) != (n_local,) + tuple(spec.shape[1:]):
                             reason = "local-param-shape"
+                if reason is None:
+                    param = ep_storage(module, pname.rsplit(".", 1)[1], param)
+                    if param is None:
+                        reason = "no-kernel-tensor"
                 if reason is not None:
                     ep_refused[reason] = ep_refused.get(reason, 0) + 1
                     continue
